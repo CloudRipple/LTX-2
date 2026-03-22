@@ -51,15 +51,19 @@ class TI2VidTwoStagesPipeline:
     def __init__(
         self,
         checkpoint_path: str,
-        distilled_lora: list[LoraPathStrengthAndSDOps],
+        distilled_lora: tuple[LoraPathStrengthAndSDOps, ...],
         spatial_upsampler_path: str,
         gemma_root: str,
-        loras: list[LoraPathStrengthAndSDOps],
+        loras: tuple[LoraPathStrengthAndSDOps, ...],
         device: torch.device = device,
         quantization: QuantizationPolicy | None = None,
+        keep_stage_weights_on_gpu: bool = False,
+        keep_model_weights_on_gpu: bool = False,
     ):
         self.device = device
         self.dtype = torch.bfloat16
+        self.keep_stage_weights_on_gpu = keep_stage_weights_on_gpu
+        self.keep_model_weights_on_gpu = keep_model_weights_on_gpu
         self.stage_1_model_ledger = ModelLedger(
             dtype=self.dtype,
             device=device,
@@ -67,6 +71,7 @@ class TI2VidTwoStagesPipeline:
             gemma_root_path=gemma_root,
             spatial_upsampler_path=spatial_upsampler_path,
             loras=loras,
+            cache_models=keep_model_weights_on_gpu,
             quantization=quantization,
         )
 
@@ -111,6 +116,8 @@ class TI2VidTwoStagesPipeline:
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        if a_context_p is None or a_context_n is None:
+            raise ValueError("Prompt encoding must provide audio context for two-stage generation.")
 
         # Stage 1: encode image conditionings with the VAE encoder, then free it
         # before loading the transformer to reduce peak VRAM.
@@ -121,18 +128,23 @@ class TI2VidTwoStagesPipeline:
             height=height // 2,
             fps=frame_rate,
         )
-        video_encoder = self.stage_1_model_ledger.video_encoder()
+        stage_1_video_encoder = self.stage_1_model_ledger.video_encoder()
         stage_1_conditionings = combined_image_conditionings(
             images=images,
             height=stage_1_output_shape.height,
             width=stage_1_output_shape.width,
-            video_encoder=video_encoder,
+            video_encoder=stage_1_video_encoder,
             dtype=dtype,
             device=self.device,
         )
-        torch.cuda.synchronize()
-        del video_encoder
-        cleanup_memory()
+        if not self.keep_stage_weights_on_gpu:
+            torch.cuda.synchronize()
+            stage_1_video_encoder = None
+            cleanup_memory()
+            stage_2_video_encoder = self.stage_1_model_ledger.video_encoder()
+        else:
+            stage_2_video_encoder = stage_1_video_encoder
+        stage_1_video_encoder = None
 
         transformer = self.stage_1_model_ledger.transformer()
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
@@ -172,15 +184,15 @@ class TI2VidTwoStagesPipeline:
             device=self.device,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
+        if not self.keep_stage_weights_on_gpu:
+            torch.cuda.synchronize()
+            del transformer
+            cleanup_memory()
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
-        video_encoder = self.stage_1_model_ledger.video_encoder()
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
-            video_encoder=video_encoder,
+            video_encoder=stage_2_video_encoder,
             upsampler=self.stage_2_model_ledger.spatial_upsampler(),
         )
 
@@ -189,13 +201,14 @@ class TI2VidTwoStagesPipeline:
             images=images,
             height=stage_2_output_shape.height,
             width=stage_2_output_shape.width,
-            video_encoder=video_encoder,
+            video_encoder=stage_2_video_encoder,
             dtype=dtype,
             device=self.device,
         )
-        del video_encoder
-        torch.cuda.synchronize()
-        cleanup_memory()
+        if not self.keep_stage_weights_on_gpu:
+            stage_2_video_encoder = None
+            torch.cuda.synchronize()
+            cleanup_memory()
 
         transformer = self.stage_2_model_ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
@@ -225,13 +238,15 @@ class TI2VidTwoStagesPipeline:
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
-            noise_scale=distilled_sigmas[0],
+            noise_scale=float(distilled_sigmas[0].item()),
             initial_video_latent=upscaled_video_latent,
             initial_audio_latent=audio_state.latent,
         )
 
         torch.cuda.synchronize()
         del transformer
+        if self.keep_stage_weights_on_gpu:
+            stage_2_video_encoder = None
         cleanup_memory()
 
         decoded_video = vae_decode_video(
@@ -241,6 +256,10 @@ class TI2VidTwoStagesPipeline:
             audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
         )
         return decoded_video, decoded_audio
+
+    def release_cached_models(self) -> None:
+        self.stage_1_model_ledger.clear_cached_models()
+        self.stage_2_model_ledger.clear_cached_models()
 
 
 @torch.inference_mode()

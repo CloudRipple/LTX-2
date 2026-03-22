@@ -3,9 +3,10 @@ import base64
 from importlib import import_module
 import json
 from email.message import Message
+from pathlib import Path
 import threading
 import time
-from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -92,6 +93,194 @@ def test_parse_service_config_accepts_fp8_scaled_mm_without_amax_path(monkeypatc
     assert config.quantization is sentinel_policy
 
 
+def test_parse_service_config_enables_keep_stage_weights_on_gpu(tmp_path: Path) -> None:
+    config = parse_service_config(_required_service_argv(tmp_path) + ["--keep-stage-weights-on-gpu"])
+
+    assert config.keep_stage_weights_on_gpu is True
+
+
+def test_parse_service_config_enables_keep_model_weights_on_gpu(tmp_path: Path) -> None:
+    config = parse_service_config(_required_service_argv(tmp_path) + ["--keep-model-weights-on-gpu"])
+
+    assert config.keep_model_weights_on_gpu is True
+
+
+@pytest.mark.parametrize(
+    ("pipeline_type", "expected_constructor"),
+    [
+        (ServingPipelineType.TI2VID_ONE_STAGE, "one_stage"),
+        (ServingPipelineType.DISTILLED, "distilled"),
+        (ServingPipelineType.TI2VID_TWO_STAGES, "two_stage"),
+    ],
+)
+def test_build_default_runner_passes_keep_stage_weights_flag(monkeypatch, tmp_path: Path, pipeline_type, expected_constructor) -> None:
+    seen: dict[str, dict[str, object]] = {}
+
+    class DummyPipeline:
+        def __init__(self, **kwargs):
+            seen[expected_constructor] = kwargs
+
+    class DummyLora:
+        def __init__(self, *args):
+            self.args = args
+
+    modules = {
+        "ltx_core.loader": SimpleNamespace(
+            LTXV_LORA_COMFY_RENAMING_MAP=object(),
+            LoraPathStrengthAndSDOps=DummyLora,
+        ),
+        "ltx_pipelines.ti2vid_one_stage": SimpleNamespace(TI2VidOneStagePipeline=DummyPipeline),
+        "ltx_pipelines.distilled": SimpleNamespace(DistilledPipeline=DummyPipeline),
+        "ltx_pipelines.ti2vid_two_stages": SimpleNamespace(TI2VidTwoStagesPipeline=DummyPipeline),
+    }
+
+    monkeypatch.setattr(backend_module.importlib, "import_module", lambda name: modules[name])
+
+    config = _make_test_config(tmp_path, pipeline_type=pipeline_type, keep_stage_weights_on_gpu=True)
+    runner = backend_module.build_default_runner(
+        config,
+        execution_mode=ExecutionMode.SINGLE,
+        gpu_ids=(0,),
+        primary_device=torch.device("cuda:0"),
+    )
+
+    assert runner is not None
+    assert seen[expected_constructor]["keep_stage_weights_on_gpu"] is True
+
+
+@pytest.mark.parametrize(
+    ("pipeline_type", "expected_constructor"),
+    [
+        (ServingPipelineType.TI2VID_ONE_STAGE, "one_stage"),
+        (ServingPipelineType.DISTILLED, "distilled"),
+        (ServingPipelineType.TI2VID_TWO_STAGES, "two_stage"),
+    ],
+)
+def test_build_default_runner_passes_keep_model_weights_flag(monkeypatch, tmp_path: Path, pipeline_type, expected_constructor) -> None:
+    seen: dict[str, dict[str, object]] = {}
+
+    class DummyPipeline:
+        def __init__(self, **kwargs):
+            seen[expected_constructor] = kwargs
+
+    class DummyLora:
+        def __init__(self, *args):
+            self.args = args
+
+    modules = {
+        "ltx_core.loader": SimpleNamespace(
+            LTXV_LORA_COMFY_RENAMING_MAP=object(),
+            LoraPathStrengthAndSDOps=DummyLora,
+        ),
+        "ltx_pipelines.ti2vid_one_stage": SimpleNamespace(TI2VidOneStagePipeline=DummyPipeline),
+        "ltx_pipelines.distilled": SimpleNamespace(DistilledPipeline=DummyPipeline),
+        "ltx_pipelines.ti2vid_two_stages": SimpleNamespace(TI2VidTwoStagesPipeline=DummyPipeline),
+    }
+
+    monkeypatch.setattr(backend_module.importlib, "import_module", lambda name: modules[name])
+
+    config = _make_test_config(tmp_path, pipeline_type=pipeline_type, keep_model_weights_on_gpu=True)
+    runner = backend_module.build_default_runner(
+        config,
+        execution_mode=ExecutionMode.SINGLE,
+        gpu_ids=(0,),
+        primary_device=torch.device("cuda:0"),
+    )
+
+    assert runner is not None
+    assert seen[expected_constructor]["keep_model_weights_on_gpu"] is True
+
+
+def test_model_ledger_caches_video_encoder_when_enabled(monkeypatch) -> None:
+    model_ledger_module = import_module("ltx_pipelines.utils.model_ledger")
+    ModelLedger = model_ledger_module.ModelLedger
+
+    class FakeModule:
+        def __init__(self, token: object):
+            self.token = token
+
+        def to(self, device):
+            _ = device
+            return self
+
+        def eval(self):
+            return self
+
+    class FakeBuilder:
+        def __init__(self):
+            self.calls = 0
+
+        def build(self, **kwargs):
+            _ = kwargs
+            self.calls += 1
+            return FakeModule(object())
+
+    ledger = ModelLedger(dtype=torch.bfloat16, device=torch.device("cpu"), cache_models=True)
+    builder = FakeBuilder()
+    ledger.vae_encoder_builder = builder
+
+    first = ledger.video_encoder()
+    second = ledger.video_encoder()
+
+    assert first is second
+    assert builder.calls == 1
+
+
+def test_model_ledger_does_not_cache_video_encoder_by_default() -> None:
+    model_ledger_module = import_module("ltx_pipelines.utils.model_ledger")
+    ModelLedger = model_ledger_module.ModelLedger
+
+    class FakeModule:
+        def to(self, device):
+            _ = device
+            return self
+
+        def eval(self):
+            return self
+
+    class FakeBuilder:
+        def __init__(self):
+            self.calls = 0
+
+        def build(self, **kwargs):
+            _ = kwargs
+            self.calls += 1
+            return FakeModule()
+
+    ledger = ModelLedger(dtype=torch.bfloat16, device=torch.device("cpu"))
+    builder = FakeBuilder()
+    ledger.vae_encoder_builder = builder
+
+    first = ledger.video_encoder()
+    second = ledger.video_encoder()
+
+    assert first is not second
+    assert builder.calls == 2
+
+
+def test_backend_shutdown_releases_cached_pipeline_models(tmp_path: Path) -> None:
+    release_calls: list[str] = []
+
+    class FakePipeline:
+        def release_cached_models(self) -> None:
+            release_calls.append("released")
+
+    backend = PipelineServiceBackend(
+        config=_make_test_config(tmp_path),
+        runner_factory=lambda: backend_module.OneStagePipelineRunner(pipeline=FakePipeline()),
+    )
+
+    async def scenario() -> None:
+        await backend.start()
+        job = await backend.submit(GenerateJobRequest(prompt="hello"))
+        _ = await _wait_for_job(backend, job.job_id, JobStatus.FAILED)
+        await backend.shutdown()
+
+    asyncio.run(scenario())
+
+    assert release_calls == ["released"]
+
+
 def test_backend_serializes_jobs(tmp_path: Path) -> None:
     first_job_started = threading.Event()
     release_first_job = threading.Event()
@@ -152,24 +341,20 @@ def test_fastapi_endpoints_report_health_and_job_status(tmp_path: Path) -> None:
 
         first_submit = client.post("/v1/videos", json={"prompt": "hello world"}).json()
         first_job_id = str(first_submit["id"])
-        first_file_id = str(first_submit["output_file_id"])
-        assert first_file_id == first_job_id
         first_job = _wait_for_generation_via_api(client, first_job_id)
-        assert first_job["output_file_id"] == first_file_id
-        first_file_metadata = client.get(f"/v1/files/{first_file_id}")
+        assert first_job["id"] == first_job_id
+        first_file_metadata = client.get(f"/v1/files/{first_job_id}")
         assert first_file_metadata.status_code == 200
-        assert first_file_metadata.json()["id"] == first_file_id
-        first_file_download = client.get(f"/v1/files/{first_file_id}/content")
+        assert first_file_metadata.json()["id"] == first_job_id
+        first_file_download = client.get(f"/v1/files/{first_job_id}/content")
         assert first_file_download.status_code == 200
         assert first_file_download.text == "hello world"
 
         second_submit = client.post("/v1/videos", json={"prompt": "goodbye"}).json()
         second_job_id = str(second_submit["id"])
-        second_file_id = str(second_submit["output_file_id"])
-        assert second_file_id == second_job_id
         second_job = _wait_for_generation_via_api(client, second_job_id)
-        assert second_job["output_file_id"] == second_file_id
-        second_file_download = client.get(f"/v1/files/{second_file_id}/content")
+        assert second_job["id"] == second_job_id
+        second_file_download = client.get(f"/v1/files/{second_job_id}/content")
         assert second_file_download.status_code == 200
         assert second_file_download.text == "goodbye"
 
@@ -241,6 +426,253 @@ def test_fastapi_rejects_two_stage_resolution_not_divisible_by_64(tmp_path: Path
 
     assert response.status_code == 422
     assert "height and width must be divisible by 64" in response.text
+
+
+def test_distilled_pipeline_skips_inter_stage_cleanup_when_keep_weights_enabled(monkeypatch) -> None:
+    distilled_module = import_module("ltx_pipelines.distilled")
+    cleanup_calls: list[str] = []
+
+    class DummyLedger:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.video_encoder_calls = 0
+            self.transformer_calls = 0
+
+        def video_encoder(self):
+            self.video_encoder_calls += 1
+            return object()
+
+        def transformer(self):
+            self.transformer_calls += 1
+            return object()
+
+        def spatial_upsampler(self):
+            return object()
+
+        def video_decoder(self):
+            return object()
+
+        def audio_decoder(self):
+            return object()
+
+        def vocoder(self):
+            return object()
+
+    monkeypatch.setattr(distilled_module, "ModelLedger", DummyLedger)
+    monkeypatch.setattr(distilled_module, "PipelineComponents", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(distilled_module, "assert_resolution", lambda **kwargs: None)
+    monkeypatch.setattr(
+        distilled_module,
+        "encode_prompts",
+        lambda *args, **kwargs: (SimpleNamespace(video_encoding="video", audio_encoding="audio"),),
+    )
+    monkeypatch.setattr(distilled_module, "combined_image_conditionings", lambda **kwargs: [])
+    monkeypatch.setattr(
+        distilled_module,
+        "denoise_audio_video",
+        lambda **kwargs: (SimpleNamespace(latent=torch.zeros(1)), SimpleNamespace(latent=torch.zeros(1))),
+    )
+    monkeypatch.setattr(distilled_module, "upsample_video", lambda **kwargs: torch.zeros(1))
+    monkeypatch.setattr(distilled_module, "vae_decode_video", lambda *args, **kwargs: iter(()))
+    monkeypatch.setattr(distilled_module, "vae_decode_audio", lambda *args, **kwargs: torch.zeros(1))
+    monkeypatch.setattr(distilled_module, "cleanup_memory", lambda: cleanup_calls.append("cleanup"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    pipeline = distilled_module.DistilledPipeline(
+        distilled_checkpoint_path="checkpoint.safetensors",
+        gemma_root="gemma",
+        spatial_upsampler_path="upsampler.safetensors",
+        loras=(),
+        device=torch.device("cpu"),
+        keep_stage_weights_on_gpu=True,
+    )
+    _ = pipeline(
+        prompt="hello",
+        seed=1,
+        height=512,
+        width=512,
+        num_frames=9,
+        frame_rate=24.0,
+        images=[],
+    )
+
+    assert cleanup_calls == ["cleanup"]
+    assert pipeline.model_ledger.video_encoder_calls == 1
+    assert pipeline.model_ledger.transformer_calls == 1
+
+
+def test_distilled_pipeline_default_behavior_runs_inter_stage_cleanup(monkeypatch) -> None:
+    distilled_module = import_module("ltx_pipelines.distilled")
+    cleanup_calls: list[str] = []
+
+    class DummyLedger:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.video_encoder_calls = 0
+            self.transformer_calls = 0
+
+        def video_encoder(self):
+            self.video_encoder_calls += 1
+            return object()
+
+        def transformer(self):
+            self.transformer_calls += 1
+            return object()
+
+        def spatial_upsampler(self):
+            return object()
+
+        def video_decoder(self):
+            return object()
+
+        def audio_decoder(self):
+            return object()
+
+        def vocoder(self):
+            return object()
+
+    monkeypatch.setattr(distilled_module, "ModelLedger", DummyLedger)
+    monkeypatch.setattr(distilled_module, "PipelineComponents", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(distilled_module, "assert_resolution", lambda **kwargs: None)
+    monkeypatch.setattr(
+        distilled_module,
+        "encode_prompts",
+        lambda *args, **kwargs: (SimpleNamespace(video_encoding="video", audio_encoding="audio"),),
+    )
+    monkeypatch.setattr(distilled_module, "combined_image_conditionings", lambda **kwargs: [])
+    monkeypatch.setattr(
+        distilled_module,
+        "denoise_audio_video",
+        lambda **kwargs: (SimpleNamespace(latent=torch.zeros(1)), SimpleNamespace(latent=torch.zeros(1))),
+    )
+    monkeypatch.setattr(distilled_module, "upsample_video", lambda **kwargs: torch.zeros(1))
+    monkeypatch.setattr(distilled_module, "vae_decode_video", lambda *args, **kwargs: iter(()))
+    monkeypatch.setattr(distilled_module, "vae_decode_audio", lambda *args, **kwargs: torch.zeros(1))
+    monkeypatch.setattr(distilled_module, "cleanup_memory", lambda: cleanup_calls.append("cleanup"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    pipeline = distilled_module.DistilledPipeline(
+        distilled_checkpoint_path="checkpoint.safetensors",
+        gemma_root="gemma",
+        spatial_upsampler_path="upsampler.safetensors",
+        loras=(),
+        device=torch.device("cpu"),
+    )
+    _ = pipeline(
+        prompt="hello",
+        seed=1,
+        height=512,
+        width=512,
+        num_frames=9,
+        frame_rate=24.0,
+        images=[],
+    )
+
+    assert cleanup_calls == ["cleanup", "cleanup"]
+    assert pipeline.model_ledger.video_encoder_calls == 1
+    assert pipeline.model_ledger.transformer_calls == 1
+
+
+def test_two_stage_pipeline_keeps_stage_models_when_enabled(monkeypatch) -> None:
+    two_stage_module = import_module("ltx_pipelines.ti2vid_two_stages")
+    cleanup_calls: list[str] = []
+    ledgers: dict[str, object] = {}
+
+    class DummyLedger:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.label = "stage1"
+            self.video_encoder_calls = 0
+            self.transformer_calls = 0
+
+        def with_additional_loras(self, loras):
+            stage2 = DummyLedger.__new__(DummyLedger)
+            stage2.kwargs = {"loras": loras}
+            stage2.label = "stage2"
+            stage2.video_encoder_calls = 0
+            stage2.transformer_calls = 0
+            ledgers["stage2"] = stage2
+            return stage2
+
+        def video_encoder(self):
+            self.video_encoder_calls += 1
+            return object()
+
+        def transformer(self):
+            self.transformer_calls += 1
+            return object()
+
+        def spatial_upsampler(self):
+            return object()
+
+        def video_decoder(self):
+            return object()
+
+        def audio_decoder(self):
+            return object()
+
+        def vocoder(self):
+            return object()
+
+    monkeypatch.setattr(two_stage_module, "ModelLedger", DummyLedger)
+    monkeypatch.setattr(two_stage_module, "PipelineComponents", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(two_stage_module, "assert_resolution", lambda **kwargs: None)
+    monkeypatch.setattr(
+        two_stage_module,
+        "encode_prompts",
+        lambda *args, **kwargs: (
+            SimpleNamespace(video_encoding="video+", audio_encoding="audio+"),
+            SimpleNamespace(video_encoding="video-", audio_encoding="audio-"),
+        ),
+    )
+    monkeypatch.setattr(two_stage_module, "combined_image_conditionings", lambda **kwargs: [])
+    monkeypatch.setattr(
+        two_stage_module,
+        "denoise_audio_video",
+        lambda **kwargs: (SimpleNamespace(latent=torch.zeros(1)), SimpleNamespace(latent=torch.zeros(1))),
+    )
+    monkeypatch.setattr(two_stage_module, "upsample_video", lambda **kwargs: torch.zeros(1))
+    monkeypatch.setattr(two_stage_module, "vae_decode_video", lambda *args, **kwargs: iter(()))
+    monkeypatch.setattr(two_stage_module, "vae_decode_audio", lambda *args, **kwargs: torch.zeros(1))
+    monkeypatch.setattr(two_stage_module, "cleanup_memory", lambda: cleanup_calls.append("cleanup"))
+    monkeypatch.setattr(two_stage_module, "create_multimodal_guider_factory", lambda **kwargs: object())
+    monkeypatch.setattr(two_stage_module, "multi_modal_guider_factory_denoising_func", lambda **kwargs: object())
+    monkeypatch.setattr(two_stage_module, "simple_denoising_func", lambda **kwargs: object())
+    monkeypatch.setattr(two_stage_module, "LTX2Scheduler", lambda: SimpleNamespace(execute=lambda steps: torch.ones(steps)))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    pipeline = two_stage_module.TI2VidTwoStagesPipeline(
+        checkpoint_path="checkpoint.safetensors",
+        distilled_lora=(),
+        spatial_upsampler_path="upsampler.safetensors",
+        gemma_root="gemma",
+        loras=(),
+        device=torch.device("cpu"),
+        keep_stage_weights_on_gpu=True,
+    )
+    ledgers["stage1"] = pipeline.stage_1_model_ledger
+    _ = pipeline(
+        prompt="hello",
+        negative_prompt="world",
+        seed=1,
+        height=512,
+        width=512,
+        num_frames=9,
+        frame_rate=24.0,
+        num_inference_steps=4,
+        video_guider_params=object(),
+        audio_guider_params=object(),
+        images=[],
+    )
+
+    stage1 = ledgers["stage1"]
+    stage2 = ledgers["stage2"]
+    assert isinstance(stage1, DummyLedger)
+    assert isinstance(stage2, DummyLedger)
+    assert cleanup_calls == ["cleanup"]
+    assert stage1.video_encoder_calls == 1
+    assert stage1.transformer_calls == 1
+    assert stage2.transformer_calls == 1
 
 
 def test_backend_materializes_url_images_and_cleans_up(tmp_path: Path, monkeypatch) -> None:
@@ -625,7 +1057,6 @@ def test_failed_job_file_endpoints_return_gone(tmp_path: Path) -> None:
         assert submit_response.status_code == 202
         payload = submit_response.json()
         job_id = str(payload["id"])
-        file_id = str(payload["output_file_id"])
 
         deadline = time.monotonic() + 2.0
         final_job = None
@@ -638,8 +1069,8 @@ def test_failed_job_file_endpoints_return_gone(tmp_path: Path) -> None:
         assert final_job is not None
         assert final_job["status"] == JobStatus.FAILED.value
 
-        file_metadata = client.get(f"/v1/files/{file_id}")
-        file_content = client.get(f"/v1/files/{file_id}/content")
+        file_metadata = client.get(f"/v1/files/{job_id}")
+        file_content = client.get(f"/v1/files/{job_id}/content")
 
     assert file_metadata.status_code == 410
     assert file_content.status_code == 410
@@ -713,6 +1144,8 @@ def _make_test_config(
     output_dir: Path,
     execution_mode=ExecutionMode.SINGLE,
     pipeline_type=ServingPipelineType.TI2VID_ONE_STAGE,
+    keep_stage_weights_on_gpu: bool = False,
+    keep_model_weights_on_gpu: bool = False,
 ):
     model_dir = output_dir / "models"
     return ServiceConfig(
@@ -724,6 +1157,8 @@ def _make_test_config(
         gamma_path=model_dir / "gamma-path",
         output_dir=output_dir,
         execution_mode=execution_mode,
+        keep_stage_weights_on_gpu=keep_stage_weights_on_gpu,
+        keep_model_weights_on_gpu=keep_model_weights_on_gpu,
     )
 
 

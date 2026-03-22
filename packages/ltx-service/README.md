@@ -15,6 +15,8 @@ Unlike the earlier in-package experiments, this package treats `ltx-core` and `l
 - persistent in-memory pipeline instance
 - serialized job execution via an internal queue
 - image conditioning from local paths, URLs, base64 strings, and multipart file uploads
+- optional stage-boundary GPU weight retention for `ti2vid-two-stages`, plus optional inter-stage GPU cache retention for `distilled`
+- optional cross-request GPU model retention inside a single `ltx-service` process
 - supports these official backends:
   - `ti2vid-one-stage`
   - `distilled`
@@ -155,6 +157,8 @@ Current options:
 - `--port`
 - `--execution-mode {auto,single,sharded}`
 - `--gpu-ids [GPU_IDS ...]`
+- `--keep-stage-weights-on-gpu`
+- `--keep-model-weights-on-gpu`
 
 Notes:
 
@@ -162,6 +166,9 @@ Notes:
 - `sharded` is not supported in this package
 - `fp8-cast` takes no extra argument
 - `fp8-scaled-mm` can take an optional amax file path only when the installed `ltx-core` version supports it
+- `--keep-stage-weights-on-gpu` keeps stage weights resident for `ti2vid-two-stages`; for `distilled` it skips the inter-stage GPU cache cleanup because the same stage models are already reused
+- `--keep-model-weights-on-gpu` caches model instances on GPU across requests in the same process, avoiding repeated weight loads until the service shuts down
+- when `--keep-model-weights-on-gpu` is enabled, weight residency already spans requests, so `--keep-stage-weights-on-gpu` mainly affects whether extra inter-stage cache cleanup runs
 
 ---
 
@@ -234,8 +241,7 @@ Example response:
 {
   "id": "1748cae271254678b5698bbe130b3b04",
   "object": "video.generation",
-  "status": "queued",
-  "output_file_id": "1748cae271254678b5698bbe130b3b04"
+  "status": "queued"
 }
 ```
 
@@ -259,7 +265,7 @@ Possible statuses:
 - `succeeded`
 - `failed`
 
-When a generation succeeds, the response exposes `output_file_id` instead of a local filesystem path.
+When a generation succeeds, the response exposes a single `id`. The same id is used for `/v1/videos/{id}` and `/v1/files/{id}`.
 If a generation finishes with `failed`, the related `/v1/files/{file_id}` endpoints return `410 Gone` because no output video exists.
 
 ### Get file metadata
@@ -424,6 +430,7 @@ Use when:
 - you need the spatial upsampler refinement stage
 - you are willing to spend more VRAM and latency
 - you are running with CUDA-enabled PyTorch
+- you want to optionally keep stage weights resident on GPU between stages
 
 ### `distilled`
 
@@ -432,6 +439,7 @@ Use when:
 - you want the official distilled path
 - you want fewer denoising steps than the full model
 - you are running with CUDA-enabled PyTorch
+- you want to optionally skip inter-stage GPU cache cleanup while reusing the same stage models
 
 ---
 

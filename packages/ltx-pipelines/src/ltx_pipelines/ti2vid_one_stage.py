@@ -49,18 +49,23 @@ class TI2VidOneStagePipeline:
         self,
         checkpoint_path: str,
         gemma_root: str,
-        loras: list[LoraPathStrengthAndSDOps],
+        loras: tuple[LoraPathStrengthAndSDOps, ...],
         device: torch.device = device,
         quantization: QuantizationPolicy | None = None,
+        keep_stage_weights_on_gpu: bool = False,
+        keep_model_weights_on_gpu: bool = False,
     ):
         self.dtype = torch.bfloat16
         self.device = device
+        self.keep_stage_weights_on_gpu = keep_stage_weights_on_gpu
+        self.keep_model_weights_on_gpu = keep_model_weights_on_gpu
         self.model_ledger = ModelLedger(
             dtype=self.dtype,
             device=device,
             checkpoint_path=checkpoint_path,
             gemma_root_path=gemma_root,
             loras=loras,
+            cache_models=keep_model_weights_on_gpu,
             quantization=quantization,
         )
         self.pipeline_components = PipelineComponents(
@@ -99,6 +104,8 @@ class TI2VidOneStagePipeline:
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        if a_context_p is None or a_context_n is None:
+            raise ValueError("Prompt encoding must provide audio context for one-stage generation.")
 
         # Encode image conditionings with the VAE encoder, then free it
         # before loading the transformer to reduce peak VRAM.
@@ -166,6 +173,9 @@ class TI2VidOneStagePipeline:
             audio_state.latent, self.model_ledger.audio_decoder(), self.model_ledger.vocoder()
         )
         return decoded_video, decoded_audio
+
+    def release_cached_models(self) -> None:
+        self.model_ledger.clear_cached_models()
 
 
 @torch.inference_mode()

@@ -1,4 +1,7 @@
+import gc
+from collections.abc import Callable
 from dataclasses import replace
+from typing import Any
 
 import torch
 
@@ -53,14 +56,12 @@ class ModelLedger:
     factory methods for constructing model instances.
     ### Model Building
     Each model method (e.g. :meth:`transformer`, :meth:`video_decoder`, :meth:`text_encoder`)
-    constructs a new model instance on each call. The builder uses the
-    :class:`~ltx_core.loader.registry.Registry` to load weights from the checkpoint,
-    instantiates the model with the configured ``dtype``, and moves it to ``self.device``.
+    uses the configured builder to load weights from the checkpoint, instantiate the
+    model with the configured ``dtype``, and move it to ``self.device``.
     .. note::
-        Models are **not cached**. Each call to a model method creates a new instance.
-        Callers are responsible for storing references to models they wish to reuse
-        and for freeing GPU memory (e.g. by deleting references and calling
-        ``torch.cuda.empty_cache()``).
+        By default, models are **not cached** and each call creates a new instance.
+        If ``cache_models=True`` is set on the ledger, built model instances are memoized
+        per ledger and reused until :meth:`clear_cached_models` is called.
     ### Constructor parameters
     dtype:
         Torch dtype used when constructing all models (e.g. ``torch.bfloat16``).
@@ -84,6 +85,9 @@ class ModelLedger:
     registry:
         Optional :class:`Registry` instance for weight caching across builders.
         Defaults to :class:`DummyRegistry` which performs no cross-builder caching.
+    cache_models:
+        If True, keep constructed model instances cached on ``self.device`` for reuse
+        across multiple method calls until :meth:`clear_cached_models` is invoked.
     quantization:
         Optional :class:`QuantizationPolicy` controlling how transformer weights
         are stored and how matmul is executed. Defaults to None, which means no quantization.
@@ -102,6 +106,7 @@ class ModelLedger:
         spatial_upsampler_path: str | None = None,
         loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
         registry: Registry | None = None,
+        cache_models: bool = False,
         quantization: QuantizationPolicy | None = None,
     ):
         self.dtype = dtype
@@ -111,7 +116,9 @@ class ModelLedger:
         self.spatial_upsampler_path = spatial_upsampler_path
         self.loras = loras
         self.registry = registry or DummyRegistry()
+        self.cache_models = cache_models
         self.quantization = quantization
+        self._cached_models: dict[str, Any] = {}
         self.build_model_builders()
 
     def build_model_builders(self) -> None:
@@ -207,8 +214,23 @@ class ModelLedger:
             spatial_upsampler_path=self.spatial_upsampler_path,
             loras=loras,
             registry=self.registry,
+            cache_models=self.cache_models,
             quantization=self.quantization,
         )
+
+    def _maybe_cached(self, name: str, builder: Callable[[], Any]) -> Any:
+        if not self.cache_models:
+            return builder()
+        if name not in self._cached_models:
+            self._cached_models[name] = builder()
+        return self._cached_models[name]
+
+    def clear_cached_models(self) -> None:
+        self._cached_models.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def transformer(self) -> X0Model:
         if not hasattr(self, "transformer_builder"):
@@ -217,24 +239,34 @@ class ModelLedger:
             )
 
         if self.quantization is None:
-            return (
+            return self._maybe_cached(
+                "transformer",
+                lambda: (
                 X0Model(self.transformer_builder.build(device=self._target_device(), dtype=self.dtype))
                 .to(self.device)
                 .eval()
+                ),
             )
         else:
             sd_ops = self.transformer_builder.model_sd_ops
-            if self.quantization.sd_ops is not None:
-                sd_ops = SDOps(
-                    name=f"sd_ops_chain_{sd_ops.name}+{self.quantization.sd_ops.name}",
-                    mapping=(*sd_ops.mapping, *self.quantization.sd_ops.mapping),
-                )
+            quantization_sd_ops = self.quantization.sd_ops
+            if quantization_sd_ops is not None:
+                if sd_ops is None:
+                    sd_ops = quantization_sd_ops
+                else:
+                    sd_ops = SDOps(
+                        name=f"sd_ops_chain_{sd_ops.name}+{quantization_sd_ops.name}",
+                        mapping=(*sd_ops.mapping, *quantization_sd_ops.mapping),
+                    )
             builder = replace(
                 self.transformer_builder,
                 module_ops=(*self.transformer_builder.module_ops, *self.quantization.module_ops),
                 model_sd_ops=sd_ops,
             )
-            return X0Model(builder.build(device=self._target_device())).to(self.device).eval()
+            return self._maybe_cached(
+                "transformer",
+                lambda: X0Model(builder.build(device=self._target_device())).to(self.device).eval(),
+            )
 
     def video_decoder(self) -> VideoDecoder:
         if not hasattr(self, "vae_decoder_builder"):
@@ -242,7 +274,10 @@ class ModelLedger:
                 "Video decoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
 
-        return self.vae_decoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        return self._maybe_cached(
+            "video_decoder",
+            lambda: self.vae_decoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval(),
+        )
 
     def video_encoder(self) -> VideoEncoder:
         if not hasattr(self, "vae_encoder_builder"):
@@ -250,7 +285,10 @@ class ModelLedger:
                 "Video encoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
 
-        return self.vae_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        return self._maybe_cached(
+            "video_encoder",
+            lambda: self.vae_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval(),
+        )
 
     def text_encoder(self) -> GemmaTextEncoder:
         if not hasattr(self, "text_encoder_builder"):
@@ -259,7 +297,10 @@ class ModelLedger:
                 "ModelLedger constructor."
             )
 
-        return self.text_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        return self._maybe_cached(
+            "text_encoder",
+            lambda: self.text_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval(),
+        )
 
     def gemma_embeddings_processor(self) -> EmbeddingsProcessor:
         if not hasattr(self, "embeddings_processor_builder"):
@@ -267,10 +308,11 @@ class ModelLedger:
                 "Embeddings processor not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
 
-        return (
-            self.embeddings_processor_builder.build(device=self._target_device(), dtype=self.dtype)
+        return self._maybe_cached(
+            "gemma_embeddings_processor",
+            lambda: self.embeddings_processor_builder.build(device=self._target_device(), dtype=self.dtype)
             .to(self.device)
-            .eval()
+            .eval(),
         )
 
     def audio_encoder(self) -> AudioEncoder:
@@ -279,7 +321,10 @@ class ModelLedger:
                 "Audio encoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
 
-        return self.audio_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        return self._maybe_cached(
+            "audio_encoder",
+            lambda: self.audio_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval(),
+        )
 
     def audio_decoder(self) -> AudioDecoder:
         if not hasattr(self, "audio_decoder_builder"):
@@ -287,7 +332,10 @@ class ModelLedger:
                 "Audio decoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
 
-        return self.audio_decoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        return self._maybe_cached(
+            "audio_decoder",
+            lambda: self.audio_decoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval(),
+        )
 
     def vocoder(self) -> Vocoder:
         if not hasattr(self, "vocoder_builder"):
@@ -295,10 +343,16 @@ class ModelLedger:
                 "Vocoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
 
-        return self.vocoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        return self._maybe_cached(
+            "vocoder",
+            lambda: self.vocoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval(),
+        )
 
     def spatial_upsampler(self) -> LatentUpsampler:
         if not hasattr(self, "upsampler_builder"):
             raise ValueError("Upsampler not initialized. Please provide upsampler path to the ModelLedger constructor.")
 
-        return self.upsampler_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        return self._maybe_cached(
+            "spatial_upsampler",
+            lambda: self.upsampler_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval(),
+        )

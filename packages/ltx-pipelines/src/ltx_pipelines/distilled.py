@@ -51,12 +51,16 @@ class DistilledPipeline:
         distilled_checkpoint_path: str,
         gemma_root: str,
         spatial_upsampler_path: str,
-        loras: list[LoraPathStrengthAndSDOps],
+        loras: tuple[LoraPathStrengthAndSDOps, ...],
         device: torch.device = device,
         quantization: QuantizationPolicy | None = None,
+        keep_stage_weights_on_gpu: bool = False,
+        keep_model_weights_on_gpu: bool = False,
     ):
         self.device = device
         self.dtype = torch.bfloat16
+        self.keep_stage_weights_on_gpu = keep_stage_weights_on_gpu
+        self.keep_model_weights_on_gpu = keep_model_weights_on_gpu
 
         self.model_ledger = ModelLedger(
             dtype=self.dtype,
@@ -65,6 +69,7 @@ class DistilledPipeline:
             spatial_upsampler_path=spatial_upsampler_path,
             gemma_root_path=gemma_root,
             loras=loras,
+            cache_models=keep_model_weights_on_gpu,
             quantization=quantization,
         )
 
@@ -99,6 +104,8 @@ class DistilledPipeline:
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+        if audio_context is None:
+            raise ValueError("Prompt encoding must provide audio context for distilled generation.")
 
         # Stage 1: Initial low resolution video generation.
         video_encoder = self.model_ledger.video_encoder()
@@ -153,8 +160,9 @@ class DistilledPipeline:
             latent=video_state.latent[:1], video_encoder=video_encoder, upsampler=self.model_ledger.spatial_upsampler()
         )
 
-        torch.cuda.synchronize()
-        cleanup_memory()
+        if not self.keep_stage_weights_on_gpu:
+            torch.cuda.synchronize()
+            cleanup_memory()
 
         stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
@@ -176,7 +184,7 @@ class DistilledPipeline:
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
-            noise_scale=stage_2_sigmas[0],
+            noise_scale=float(stage_2_sigmas[0].item()),
             initial_video_latent=upscaled_video_latent,
             initial_audio_latent=audio_state.latent,
         )
@@ -193,6 +201,9 @@ class DistilledPipeline:
             audio_state.latent, self.model_ledger.audio_decoder(), self.model_ledger.vocoder()
         )
         return decoded_video, decoded_audio
+
+    def release_cached_models(self) -> None:
+        self.model_ledger.clear_cached_models()
 
 
 @torch.inference_mode()

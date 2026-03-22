@@ -19,6 +19,8 @@
 - 单进程内持久化保留一个 pipeline 实例
 - 内部任务队列串行执行
 - 图像条件输入支持本地路径、URL、base64 字符串和 multipart 上传文件
+- `ti2vid-two-stages` 支持可选的 stage 边界 GPU 权重保留，`distilled` 支持可选跳过 stage 之间的 GPU cache 清理
+- 支持在同一个 `ltx-service` 进程内跨请求保留 GPU 模型实例
 - 支持以下官方 pipeline 后端：
   - `ti2vid-one-stage`
   - `distilled`
@@ -163,6 +165,8 @@ GAMMA_PATH="<gamma-path>"
 - `--port`
 - `--execution-mode {auto,single,sharded}`
 - `--gpu-ids [GPU_IDS ...]`
+- `--keep-stage-weights-on-gpu`
+- `--keep-model-weights-on-gpu`
 
 说明：
 
@@ -170,6 +174,9 @@ GAMMA_PATH="<gamma-path>"
 - `sharded` 在当前独立包中不支持
 - `fp8-cast` 不接受额外参数
 - `fp8-scaled-mm` 只有在当前安装的 `ltx-core` 版本支持时，才可以额外传一个可选的 amax 文件路径
+- `--keep-stage-weights-on-gpu` 会让 `ti2vid-two-stages` 在 stage 之间继续保留权重；对 `distilled` 来说，它会跳过 stage 之间的 GPU cache 清理，因为该路径本来就会复用同一组 stage 模型
+- `--keep-model-weights-on-gpu` 会在同一个服务进程内把模型实例缓存在 GPU 上，避免每个请求都重新加载权重；服务关闭时这些缓存会被释放
+- 当 `--keep-model-weights-on-gpu` 开启后，权重本身已经会跨请求常驻 GPU，所以 `--keep-stage-weights-on-gpu` 主要只会影响是否额外执行 stage 间 cache 清理
 
 ---
 
@@ -242,8 +249,7 @@ curl -X POST http://127.0.0.1:8000/v1/videos \
 {
   "id": "1748cae271254678b5698bbe130b3b04",
   "object": "video.generation",
-  "status": "queued",
-  "output_file_id": "1748cae271254678b5698bbe130b3b04"
+  "status": "queued"
 }
 ```
 
@@ -267,7 +273,7 @@ watch -n 5 "curl -s http://127.0.0.1:8000/v1/videos/${VIDEO_ID}"
 - `succeeded`
 - `failed`
 
-任务成功后，生成接口不会返回本地文件路径，而是返回 `output_file_id`。
+任务成功后，生成接口只返回一个 `id`；这个 id 同时用于 `/v1/videos/{id}` 和 `/v1/files/{id}`。
 如果任务最终是 `failed`，对应的 `/v1/files/{file_id}` 接口会返回 `410 Gone`，因为实际上没有输出视频文件。
 
 ### 查询文件元数据
@@ -432,6 +438,7 @@ curl http://127.0.0.1:8000/v1/files/<file-id>/content --output result.mp4
 - 需要 spatial upsampler 精修阶段
 - 可以接受更高显存和更长耗时
 - 当前运行环境使用的是支持 CUDA 的 PyTorch
+- 希望可选地在 stage 之间把权重继续留在 GPU 上
 
 ### `distilled`
 
@@ -440,6 +447,7 @@ curl http://127.0.0.1:8000/v1/files/<file-id>/content --output result.mp4
 - 想使用官方 distilled 路径
 - 希望 denoising 步数少一些
 - 当前运行环境使用的是支持 CUDA 的 PyTorch
+- 希望在复用同一组 stage 模型的同时，可选地跳过 stage 之间的 GPU cache 清理
 
 ---
 

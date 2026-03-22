@@ -250,7 +250,6 @@ class VideoGenerationResponse(BaseModel):
     id: str
     object: str = "video.generation"
     status: JobStatus
-    output_file_id: str
     error: str | None = None
     created_at: int
     started_at: int | None = None

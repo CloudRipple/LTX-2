@@ -97,6 +97,8 @@ class ServiceConfig:
     port: int = 8000
     execution_mode: ExecutionMode = ExecutionMode.AUTO
     gpu_ids: tuple[int, ...] = field(default_factory=tuple)
+    keep_stage_weights_on_gpu: bool = False
+    keep_model_weights_on_gpu: bool = False
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "ServiceConfig":
@@ -113,6 +115,8 @@ class ServiceConfig:
             port=args.port,
             execution_mode=ExecutionMode(args.execution_mode),
             gpu_ids=tuple(args.gpu_ids or ()),
+            keep_stage_weights_on_gpu=bool(args.keep_stage_weights_on_gpu),
+            keep_model_weights_on_gpu=bool(args.keep_model_weights_on_gpu),
         )
 
     def visible_gpu_ids(self) -> tuple[int, ...]:
@@ -241,6 +245,22 @@ def build_service_arg_parser() -> argparse.ArgumentParser:
         nargs="*",
         default=None,
         help="Optional subset of visible CUDA device ids to use, for example: --gpu-ids 0.",
+    )
+    parser.add_argument(
+        "--keep-stage-weights-on-gpu",
+        action="store_true",
+        help=(
+            "Keep stage-boundary weights resident on GPU for ti2vid-two-stages, and skip inter-stage GPU cache "
+            "cleanup for distilled. This reduces stage-boundary churn but increases VRAM usage."
+        ),
+    )
+    parser.add_argument(
+        "--keep-model-weights-on-gpu",
+        action="store_true",
+        help=(
+            "Keep model instances cached on GPU across requests within the same ltx-service process. "
+            "This avoids repeated weight loading but increases steady-state VRAM usage."
+        ),
     )
     return parser
 

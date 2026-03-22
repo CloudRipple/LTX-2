@@ -74,6 +74,11 @@ class OneStagePipelineRunner:
                 video_chunks_number=1,
             )
 
+    def close(self) -> None:
+        release = getattr(self.pipeline, "release_cached_models", None)
+        if callable(release):
+            release()
+
 
 @dataclass
 class DistilledPipelineRunner:
@@ -106,6 +111,11 @@ class DistilledPipelineRunner:
                 output_path=output_path.as_posix(),
                 video_chunks_number=video_chunks_number,
             )
+
+    def close(self) -> None:
+        release = getattr(self.pipeline, "release_cached_models", None)
+        if callable(release):
+            release()
 
 
 @dataclass
@@ -144,11 +154,15 @@ class TwoStagePipelineRunner:
                 video_chunks_number=video_chunks_number,
             )
 
+    def close(self) -> None:
+        release = getattr(self.pipeline, "release_cached_models", None)
+        if callable(release):
+            release()
+
 
 @dataclass
 class JobRecord:
     job_id: str
-    output_file_id: str
     request: GenerateJobRequest
     uploaded_files: dict[str, UploadedImagePayload]
     output_path: Path
@@ -162,7 +176,6 @@ class JobRecord:
         return VideoGenerationResponse(
             id=self.job_id,
             status=self.status,
-            output_file_id=self.output_file_id,
             error=self.error,
             created_at=int(self.created_at.timestamp()),
             started_at=int(self.started_at.timestamp()) if self.started_at is not None else None,
@@ -173,7 +186,7 @@ class JobRecord:
         size_bytes = self.output_path.stat().st_size if self.output_path.exists() else 0
         created_unix = int(self.created_at.timestamp())
         return FileObjectResponse(
-            id=self.output_file_id,
+            id=self.job_id,
             bytes=size_bytes,
             created_at=created_unix,
             filename=self.output_path.name,
@@ -205,9 +218,11 @@ def build_default_runner(
         pipeline = TI2VidOneStagePipeline(
             checkpoint_path=config.require_checkpoint_path().as_posix(),
             gemma_root=config.require_gamma_path().as_posix(),
-            loras=[],
+            loras=(),
             device=primary_device,
             quantization=config.quantization,
+            keep_stage_weights_on_gpu=config.keep_stage_weights_on_gpu,
+            keep_model_weights_on_gpu=config.keep_model_weights_on_gpu,
         )
         return OneStagePipelineRunner(pipeline=pipeline)
 
@@ -219,6 +234,8 @@ def build_default_runner(
             loras=(),
             device=primary_device,
             quantization=config.quantization,
+            keep_stage_weights_on_gpu=config.keep_stage_weights_on_gpu,
+            keep_model_weights_on_gpu=config.keep_model_weights_on_gpu,
         )
         return DistilledPipelineRunner(pipeline=pipeline)
 
@@ -237,6 +254,8 @@ def build_default_runner(
         loras=(),
         device=primary_device,
         quantization=config.quantization,
+        keep_stage_weights_on_gpu=config.keep_stage_weights_on_gpu,
+        keep_model_weights_on_gpu=config.keep_model_weights_on_gpu,
     )
     return TwoStagePipelineRunner(pipeline=pipeline)
 
@@ -282,6 +301,12 @@ class PipelineServiceBackend:
         self._accepting_jobs = False
         await self._queue.put(None)
         await self._worker_task
+        runner = self._runner
+        self._runner = None
+        if runner is not None:
+            close = getattr(runner, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
         self._worker_task = None
 
     async def submit(
@@ -293,10 +318,8 @@ class PipelineServiceBackend:
             raise RuntimeError("Pipeline service backend is not accepting new jobs.")
         self._validate_request(request)
         job_id = uuid4().hex
-        output_file_id = job_id
         job = JobRecord(
             job_id=job_id,
-            output_file_id=output_file_id,
             request=request,
             uploaded_files=dict(uploaded_files or {}),
             output_path=self.output_dir / f"{job_id}.mp4",
@@ -320,7 +343,7 @@ class PipelineServiceBackend:
 
     def get_file(self, file_id: str) -> JobRecord | None:
         for job in self._jobs.values():
-            if job.output_file_id == file_id:
+            if job.job_id == file_id:
                 return job
         return None
 
