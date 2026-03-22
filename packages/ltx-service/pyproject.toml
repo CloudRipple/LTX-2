@@ -1,0 +1,12 @@
+[project]
+name = "ltx-service"
+version = "0.1.0"
+description = "Standalone FastAPI wrapper for LTX-2 pipelines"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["ltx-core", "ltx-pipelines", "fastapi", "httpx", "uvicorn", "transformers>=4.52,<4.53"]
+
+
+[build-system]
+requires = ["uv_build>=0.9.8,<0.10.0"]
+build-backend = "uv_build"
