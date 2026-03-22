@@ -1,9 +1,13 @@
 import asyncio
 import base64
+from dataclasses import dataclass
+from io import StringIO
 from importlib import import_module
 import json
+import logging
 from email.message import Message
 from pathlib import Path
+import signal
 import threading
 import time
 from types import SimpleNamespace
@@ -56,6 +60,43 @@ def test_service_config_auto_prefers_single_when_gpus_are_visible(monkeypatch) -
     assert config.visible_gpu_ids() == (0, 1)
     assert config.resolved_execution_mode() is ExecutionMode.SINGLE
     assert config.primary_device() == torch.device("cuda:0")
+    assert config.worker_devices() == (torch.device("cuda:0"),)
+
+
+def test_service_config_supports_data_parallel_mode(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    config = _make_test_config(Path("/tmp/ltx-service-test"), execution_mode=ExecutionMode.DATA_PARALLEL)
+
+    assert config.visible_gpu_ids() == (0, 1)
+    assert config.resolved_execution_mode() is ExecutionMode.DATA_PARALLEL
+    assert config.worker_devices() == (torch.device("cuda:0"), torch.device("cuda:1"))
+
+
+def test_service_config_uses_gpu_count_when_ids_are_not_specified(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+
+    config = _make_test_config(Path("/tmp/ltx-service-test"), execution_mode=ExecutionMode.DATA_PARALLEL, gpu_count=2)
+
+    assert config.visible_gpu_ids() == (0, 1)
+    assert config.worker_devices() == (torch.device("cuda:0"), torch.device("cuda:1"))
+
+
+def test_service_config_gpu_ids_override_gpu_count(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+
+    config = _make_test_config(
+        Path("/tmp/ltx-service-test"),
+        execution_mode=ExecutionMode.DATA_PARALLEL,
+        gpu_ids=(1, 3),
+        gpu_count=1,
+    )
+
+    assert config.visible_gpu_ids() == (1, 3)
+    assert config.worker_devices() == (torch.device("cuda:1"), torch.device("cuda:3"))
 
 
 def test_official_backend_requires_cuda(monkeypatch, tmp_path: Path) -> None:
@@ -63,6 +104,84 @@ def test_official_backend_requires_cuda(monkeypatch, tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="require CUDA-enabled PyTorch"):
         PipelineServiceBackend(config=_make_test_config(tmp_path))
+
+
+def test_ctrl_c_server_starts_force_exit_timer_on_first_sigint(monkeypatch) -> None:
+    service_module = import_module("ltx_service")
+    uvicorn = import_module("uvicorn")
+    started_timers: list[float] = []
+
+    async def app(scope, receive, send):
+        _ = (scope, receive, send)
+
+    monkeypatch.setattr(service_module, "_start_force_exit_timer", lambda timeout: started_timers.append(timeout))
+    server = service_module._ImmediateCtrlCServer(uvicorn.Config(app, host="127.0.0.1", port=0))
+
+    server._server.handle_exit(signal.SIGINT, None)
+
+    assert server._server.should_exit is True
+    assert server._server.force_exit is False
+    assert started_timers == [service_module.CTRL_C_FORCE_EXIT_TIMEOUT_SECONDS]
+
+
+def test_ctrl_c_server_forces_exit_on_second_sigint(monkeypatch) -> None:
+    service_module = import_module("ltx_service")
+    uvicorn = import_module("uvicorn")
+
+    async def app(scope, receive, send):
+        _ = (scope, receive, send)
+
+    monkeypatch.setattr(service_module, "_start_force_exit_timer", lambda timeout: None)
+
+    def fake_exit(code: int) -> None:
+        raise SystemExit(code)
+
+    monkeypatch.setattr(service_module.os, "_exit", fake_exit)
+    server = service_module._ImmediateCtrlCServer(uvicorn.Config(app, host="127.0.0.1", port=0))
+
+    server._server.handle_exit(signal.SIGINT, None)
+    with pytest.raises(SystemExit) as exc_info:
+        server._server.handle_exit(signal.SIGINT, None)
+
+    assert exc_info.value.code == 130
+
+
+def test_main_uses_immediate_ctrl_c_server(monkeypatch) -> None:
+    service_module = import_module("ltx_service")
+    uvicorn = import_module("uvicorn")
+    parsed_config = ServiceConfig(gamma_path=Path("gamma"))
+    captured: dict[str, object] = {}
+
+    class FakeServer:
+        def __init__(self, config) -> None:
+            captured["server_config"] = config
+
+        def run(self) -> None:
+            captured["ran"] = True
+
+    monkeypatch.setattr(service_module, "parse_service_config", lambda: parsed_config)
+
+    def fake_create_app(config):
+        captured["app_config"] = config
+        return object()
+
+    monkeypatch.setattr(service_module, "create_app", fake_create_app)
+    monkeypatch.setattr(service_module, "_ImmediateCtrlCServer", FakeServer)
+
+    class FakeConfig:
+        def __init__(self, app, *, host: str, port: int) -> None:
+            captured["uvicorn_app"] = app
+            captured["host"] = host
+            captured["port"] = port
+
+    monkeypatch.setattr(uvicorn, "Config", FakeConfig)
+
+    service_module.main()
+
+    assert captured["app_config"] is parsed_config
+    assert captured["host"] == parsed_config.host
+    assert captured["port"] == parsed_config.port
+    assert captured["ran"] is True
 
 
 def test_parse_service_config_accepts_fp8_scaled_mm_without_amax_path(monkeypatch, tmp_path: Path) -> None:
@@ -97,6 +216,12 @@ def test_parse_service_config_enables_keep_stage_weights_on_gpu(tmp_path: Path) 
     config = parse_service_config(_required_service_argv(tmp_path) + ["--keep-stage-weights-on-gpu"])
 
     assert config.keep_stage_weights_on_gpu is True
+
+
+def test_parse_service_config_accepts_gpu_count(tmp_path: Path) -> None:
+    config = parse_service_config(_required_service_argv(tmp_path) + ["--gpu-count", "2"])
+
+    assert config.gpu_count == 2
 
 
 def test_parse_service_config_enables_keep_model_weights_on_gpu(tmp_path: Path) -> None:
@@ -281,6 +406,222 @@ def test_backend_shutdown_releases_cached_pipeline_models(tmp_path: Path) -> Non
     assert release_calls == ["released"]
 
 
+def test_data_parallel_backend_balances_jobs_across_gpu_workers(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    runner_builds: list[tuple[int, str]] = []
+    seen_workers: list[tuple[str, int]] = []
+    active_workers = 0
+    max_active_workers = 0
+    active_lock = threading.Lock()
+    both_workers_started = threading.Event()
+    release_workers = threading.Event()
+
+    class FakeRunner:
+        def __init__(self, worker_index: int, device: torch.device):
+            self.worker_index = worker_index
+            self.device = device
+
+        def generate(self, request, output_path: Path) -> None:
+            nonlocal active_workers, max_active_workers
+            seen_workers.append((request.prompt, self.worker_index))
+            should_block = request.prompt in {"first", "second"}
+            if should_block:
+                with active_lock:
+                    active_workers += 1
+                    max_active_workers = max(max_active_workers, active_workers)
+                    if active_workers == 2:
+                        both_workers_started.set()
+                release_workers.wait(timeout=1.0)
+                with active_lock:
+                    active_workers -= 1
+            _ = output_path.write_text(f"{request.prompt}@{self.device}")
+
+    def build_runner(*, device: torch.device, worker_index: int, gpu_id: int | None = None):
+        runner_builds.append((worker_index, str(device)))
+        assert gpu_id == worker_index
+        return FakeRunner(worker_index=worker_index, device=device)
+
+    backend = PipelineServiceBackend(
+        config=_make_test_config(tmp_path, execution_mode=ExecutionMode.DATA_PARALLEL),
+        runner_factory=build_runner,
+    )
+
+    async def scenario() -> None:
+        await backend.start()
+        try:
+            health = backend.health()
+            assert health.worker_count == 2
+            assert health.loaded_runner_count == 0
+            assert health.pipeline_loaded is False
+
+            first_job = await backend.submit(GenerateJobRequest(prompt="first"))
+            second_job = await backend.submit(GenerateJobRequest(prompt="second"))
+            third_job = await backend.submit(GenerateJobRequest(prompt="third"))
+
+            await asyncio.to_thread(both_workers_started.wait, 1.0)
+            assert backend.get_job(third_job.job_id).status is JobStatus.QUEUED
+            health = backend.health()
+            assert health.worker_count == 2
+            assert health.loaded_runner_count == 2
+            assert health.pipeline_loaded is True
+            assert max_active_workers == 2
+            assert {worker for prompt, worker in seen_workers if prompt in {"first", "second"}} == {0, 1}
+
+            release_workers.set()
+            first_record = await _wait_for_job(backend, first_job.job_id, JobStatus.SUCCEEDED)
+            second_record = await _wait_for_job(backend, second_job.job_id, JobStatus.SUCCEEDED)
+            third_record = await _wait_for_job(backend, third_job.job_id, JobStatus.SUCCEEDED)
+
+            assert first_record.output_path.read_text().startswith("first@cuda:")
+            assert second_record.output_path.read_text().startswith("second@cuda:")
+            assert third_record.output_path.read_text().startswith("third@cuda:")
+            assert runner_builds == [(0, "cuda:0"), (1, "cuda:1")]
+        finally:
+            await backend.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_data_parallel_backend_shutdown_closes_all_runners(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    released_workers: list[int] = []
+
+    class FakeRunner:
+        def __init__(self, worker_index: int):
+            self.worker_index = worker_index
+
+        def generate(self, request, output_path: Path) -> None:
+            _ = request
+            _ = output_path.write_text(f"worker-{self.worker_index}")
+
+        def close(self) -> None:
+            released_workers.append(self.worker_index)
+
+    def build_runner(*, worker_index: int, **kwargs):
+        _ = kwargs
+        return FakeRunner(worker_index)
+
+    backend = PipelineServiceBackend(
+        config=_make_test_config(tmp_path, execution_mode=ExecutionMode.DATA_PARALLEL),
+        runner_factory=build_runner,
+    )
+
+    async def scenario() -> None:
+        await backend.start()
+        try:
+            first_job = await backend.submit(GenerateJobRequest(prompt="first"))
+            second_job = await backend.submit(GenerateJobRequest(prompt="second"))
+            await _wait_for_job(backend, first_job.job_id, JobStatus.SUCCEEDED)
+            await _wait_for_job(backend, second_job.job_id, JobStatus.SUCCEEDED)
+        finally:
+            await backend.shutdown()
+
+    asyncio.run(scenario())
+
+    assert sorted(released_workers) == [0, 1]
+
+
+def test_backend_logs_aggregated_worker_progress(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    first_updates = threading.Event()
+    release_workers = threading.Event()
+
+    class FakeRunner:
+        def __init__(self, worker_index: int):
+            self.worker_index = worker_index
+
+        def generate(self, request, output_path: Path, progress_callback=None) -> None:
+            assert progress_callback is not None
+            progress_callback("stage1", 1, 4)
+            first_updates.set()
+            release_workers.wait(timeout=1.0)
+            progress_callback("encode", 1, 1)
+            _ = output_path.write_text(request.prompt)
+
+    def build_runner(*, worker_index: int, **kwargs):
+        _ = kwargs
+        return FakeRunner(worker_index)
+
+    backend = PipelineServiceBackend(
+        config=_make_test_config(tmp_path, execution_mode=ExecutionMode.DATA_PARALLEL),
+        runner_factory=build_runner,
+    )
+    progress_logger = backend_module.progress_logger
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    original_level = progress_logger.level
+    original_propagate = progress_logger.propagate
+    progress_logger.addHandler(handler)
+    progress_logger.setLevel(logging.INFO)
+    progress_logger.propagate = False
+
+    async def scenario() -> None:
+        await backend.start()
+        try:
+            first_job = await backend.submit(GenerateJobRequest(prompt="first"))
+            second_job = await backend.submit(GenerateJobRequest(prompt="second"))
+            await asyncio.to_thread(first_updates.wait, 1.0)
+            await asyncio.sleep(0.05)
+            release_workers.set()
+            await _wait_for_job(backend, first_job.job_id, JobStatus.SUCCEEDED)
+            await _wait_for_job(backend, second_job.job_id, JobStatus.SUCCEEDED)
+        finally:
+            await backend.shutdown()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        progress_logger.removeHandler(handler)
+        progress_logger.setLevel(original_level)
+        progress_logger.propagate = original_propagate
+
+    log_output = stream.getvalue()
+    assert "Worker progress | w0:" in log_output
+    assert "| w1:" in log_output
+
+
+def test_euler_denoising_loop_uses_progress_callback_without_tqdm(monkeypatch) -> None:
+    samplers_module = import_module("ltx_pipelines.utils.samplers")
+
+    def fail_tqdm(iterable):
+        raise AssertionError("tqdm should not be used when progress_callback is provided")
+
+    monkeypatch.setattr(samplers_module, "tqdm", fail_tqdm)
+
+    class FakeStepper:
+        def step(self, sample, denoised_sample, sigmas, step_idx):
+            _ = (sigmas, step_idx)
+            return sample + denoised_sample
+
+    @dataclass
+    class FakeLatentState:
+        latent: torch.Tensor
+        denoise_mask: torch.Tensor
+        clean_latent: torch.Tensor
+
+    state = FakeLatentState(latent=torch.zeros(1), denoise_mask=torch.ones(1), clean_latent=torch.zeros(1))
+    progress_updates: list[tuple[int, int]] = []
+
+    video_state, audio_state = samplers_module.euler_denoising_loop(
+        sigmas=torch.tensor([1.0, 0.5, 0.0]),
+        video_state=state,
+        audio_state=state,
+        stepper=FakeStepper(),
+        denoise_fn=lambda *args, **kwargs: (torch.ones(1), torch.ones(1)),
+        progress_callback=lambda current, total: progress_updates.append((current, total)),
+    )
+
+    assert torch.equal(video_state.latent, torch.full((1,), 2.0))
+    assert torch.equal(audio_state.latent, torch.full((1,), 2.0))
+    assert progress_updates == [(0, 2), (1, 2), (2, 2)]
+
+
 def test_backend_serializes_jobs(tmp_path: Path) -> None:
     first_job_started = threading.Event()
     release_first_job = threading.Event()
@@ -338,6 +679,8 @@ def test_fastapi_endpoints_report_health_and_job_status(tmp_path: Path) -> None:
         health_response = client.get("/health")
         assert health_response.status_code == 200
         assert health_response.json()["pipeline_loaded"] is False
+        assert health_response.json()["worker_count"] == 1
+        assert health_response.json()["loaded_runner_count"] == 0
 
         first_submit = client.post("/v1/videos", json={"prompt": "hello world"}).json()
         first_job_id = str(first_submit["id"])
@@ -363,6 +706,8 @@ def test_fastapi_endpoints_report_health_and_job_status(tmp_path: Path) -> None:
         health_response = client.get("/health")
         assert health_response.status_code == 200
         assert health_response.json()["pipeline_loaded"] is True
+        assert health_response.json()["worker_count"] == 1
+        assert health_response.json()["loaded_runner_count"] == 1
 
         missing_generation_response = client.get("/v1/videos/missing-job")
         assert missing_generation_response.status_code == 404
@@ -1144,6 +1489,8 @@ def _make_test_config(
     output_dir: Path,
     execution_mode=ExecutionMode.SINGLE,
     pipeline_type=ServingPipelineType.TI2VID_ONE_STAGE,
+    gpu_ids: tuple[int, ...] = (),
+    gpu_count: int | None = None,
     keep_stage_weights_on_gpu: bool = False,
     keep_model_weights_on_gpu: bool = False,
 ):
@@ -1157,6 +1504,8 @@ def _make_test_config(
         gamma_path=model_dir / "gamma-path",
         output_dir=output_dir,
         execution_mode=execution_mode,
+        gpu_ids=gpu_ids,
+        gpu_count=gpu_count,
         keep_stage_weights_on_gpu=keep_stage_weights_on_gpu,
         keep_model_weights_on_gpu=keep_model_weights_on_gpu,
     )

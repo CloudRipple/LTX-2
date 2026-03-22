@@ -273,6 +273,8 @@ class HealthResponse(BaseModel):
     execution_mode: ExecutionMode
     primary_device: str
     gpu_ids: list[int] = Field(default_factory=list)
+    worker_count: int
+    loaded_runner_count: int
 
 
 @dataclass(frozen=True)

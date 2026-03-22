@@ -2,13 +2,13 @@
 
 `ltx-service` 是一个基于官方 `ltx-pipelines` 的独立 FastAPI 服务封装。
 
-它会在进程内常驻一个官方 pipeline 实例，串行排队处理请求，把生成结果写入磁盘，并提供一个简单的 HTTP API 用于：
+它会在进程内常驻一个或多个官方单设备 pipeline 实例，排队处理请求，把生成结果写入磁盘，并提供一个简单的 HTTP API 用于：
 
 - 提交生成任务
 - 健康检查
 - 查询任务状态
 
-与之前把服务直接塞进依赖包内部的做法不同，这个包把 `ltx-core` 和 `ltx-pipelines` 视为普通依赖，**不需要修改它们的源码**。
+与之前把服务直接塞进依赖包内部的做法不同，这个包仍然把 `ltx-service` 作为服务入口，并只对上游 `ltx-pipelines` 做最小的运行时钩子改动，例如进度上报。
 
 ---
 
@@ -16,8 +16,8 @@
 
 - 独立服务包，位置在 `packages/ltx-service`
 - 直接包装官方 `ltx_pipelines` pipeline 类
-- 单进程内持久化保留一个 pipeline 实例
-- 内部任务队列串行执行
+- 单进程内持久化保留一个或多个 pipeline 实例
+- 共享内部任务队列，可选单 worker 或多 GPU worker 执行
 - 图像条件输入支持本地路径、URL、base64 字符串和 multipart 上传文件
 - `ti2vid-two-stages` 支持可选的 stage 边界 GPU 权重保留，`distilled` 支持可选跳过 stage 之间的 GPU cache 清理
 - 支持在同一个 `ltx-service` 进程内跨请求保留 GPU 模型实例
@@ -36,6 +36,7 @@
 `ltx-service` 当前运行的是**官方单设备 pipeline 路径**。
 
 - `--execution-mode auto` 会解析为 `single`
+- `--execution-mode data-parallel` 会为每张选中的 GPU 启动一个官方单设备 runner，并通过共享队列做负载均衡
 - `--execution-mode sharded` 在这个独立包中会被明确拒绝
 
 这是有意为之：`ltx-service` 的目标是做一个尽可能薄的服务封装层，而不是在上游 pipeline 之外再维护一套自定义多卡运行时逻辑。
@@ -91,7 +92,7 @@ GAMMA_PATH="<gamma-path>"
   --spatial-upsampler-path "${SPATIAL_UPSAMPLER_PATH}" \
   --gamma-path "${GAMMA_PATH}" \
   --execution-mode single \
-  --gpu-ids 0 \
+  --gpu-count 1 \
   --quantization fp8-cast \
   --output-dir outputs/ltx-service
 ```
@@ -107,7 +108,7 @@ GAMMA_PATH="<gamma-path>"
   --checkpoint-path "${CHECKPOINT_PATH}" \
   --gamma-path "${GAMMA_PATH}" \
   --execution-mode single \
-  --gpu-ids 0 \
+  --gpu-count 1 \
   --quantization fp8-cast \
   --output-dir outputs/ltx-service
 ```
@@ -125,7 +126,27 @@ GAMMA_PATH="<gamma-path>"
   --spatial-upsampler-path "${SPATIAL_UPSAMPLER_PATH}" \
   --gamma-path "${GAMMA_PATH}" \
   --execution-mode single \
-  --gpu-ids 0 \
+  --gpu-count 1 \
+  --quantization fp8-cast \
+  --output-dir outputs/ltx-service
+```
+
+### 4）data-parallel two-stage 服务
+
+```bash
+CHECKPOINT_PATH="<full-checkpoint-path>"
+DISTILLED_LORA_PATH="<distilled-lora-path>"
+SPATIAL_UPSAMPLER_PATH="<spatial-upsampler-path>"
+GAMMA_PATH="<gamma-path>"
+
+./.venv/bin/python -m ltx_service \
+  --pipeline-type ti2vid-two-stages \
+  --checkpoint-path "${CHECKPOINT_PATH}" \
+  --distilled-lora "${DISTILLED_LORA_PATH}" \
+  --spatial-upsampler-path "${SPATIAL_UPSAMPLER_PATH}" \
+  --gamma-path "${GAMMA_PATH}" \
+  --execution-mode data-parallel \
+  --gpu-count 2 \
   --quantization fp8-cast \
   --output-dir outputs/ltx-service
 ```
@@ -163,15 +184,20 @@ GAMMA_PATH="<gamma-path>"
 - `--output-dir`
 - `--host`
 - `--port`
-- `--execution-mode {auto,single,sharded}`
+- `--execution-mode {auto,single,data-parallel,sharded}`
 - `--gpu-ids [GPU_IDS ...]`
+- `--gpu-count`
 - `--keep-stage-weights-on-gpu`
 - `--keep-model-weights-on-gpu`
 
 说明：
 
 - `auto` 当前会解析为 `single`
+- `data-parallel` 会为每张选中的 GPU 启动一个服务 worker，并通过共享 FIFO 队列分发请求
 - `sharded` 在当前独立包中不支持
+- `--gpu-ids` 的优先级高于 `--gpu-count`
+- 如果未指定 `--gpu-ids`，但设置了 `--gpu-count`，服务会自动选择前 N 张可见 GPU
+- 如果 `--gpu-ids` 和 `--gpu-count` 都未设置，服务会自动探测全部可见 GPU
 - `fp8-cast` 不接受额外参数
 - `fp8-scaled-mm` 只有在当前安装的 `ltx-core` 版本支持时，才可以额外传一个可选的 amax 文件路径
 - `--keep-stage-weights-on-gpu` 会让 `ti2vid-two-stages` 在 stage 之间继续保留权重；对 `distilled` 来说，它会跳过 stage 之间的 GPU cache 清理，因为该路径本来就会复用同一组 stage 模型
@@ -198,7 +224,9 @@ curl http://127.0.0.1:8000/health
   "pipeline_type": "ti2vid-two-stages",
   "execution_mode": "single",
   "primary_device": "cuda:0",
-  "gpu_ids": [0]
+  "gpu_ids": [0],
+  "worker_count": 1,
+  "loaded_runner_count": 0
 }
 ```
 
@@ -453,14 +481,19 @@ curl http://127.0.0.1:8000/v1/files/<file-id>/content --output result.mp4
 
 ## 运行行为
 
-`ltx-service` 每个进程只会持有一个 pipeline 实例。
+`ltx-service` 每个进程会为每个 worker 持有一个 pipeline 实例。
 
 - 第一个请求会承担模型加载开销
-- 后续请求会复用同一个常驻 pipeline
-- 所有任务**串行执行**
-- 当前任务运行时，后续任务会停留在队列里
+- 后续请求会复用对应 worker 上的常驻 pipeline
+- `single` 模式下所有任务**串行执行**
+- `data-parallel` 模式下会为每张选中的 GPU 启动一个 worker，并从同一个 FIFO 队列中取任务
+- 当所有 worker 都忙时，后续任务会停留在队列里
 
-这是刻意设计的，因为 LTX 推理显存占用很高，在单设备上并发运行通常不稳定。
+这是刻意设计的，因为 LTX 推理显存占用很高：`single` 模式在单设备上保持最保守的执行模型，而 `data-parallel` 模式则通过复制官方单设备 runner 的方式横向扩展到多张 GPU。
+
+当服务收到 `Ctrl+C` 时，会先给 shutdown 一个很短的时间窗口去释放 runner 和缓存权重；如果进程仍然被进行中的任务卡住，就会强制退出，避免服务无限挂起。
+
+在服务端推理时，`ltx-service` 会抑制每个 worker 各自的 tqdm 进度条，改为输出聚合后的 `info` 日志，这样一条日志就能同时展示所有活跃 worker 的当前进度。
 
 ---
 

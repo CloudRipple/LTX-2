@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import torch
 
@@ -87,6 +87,7 @@ class TI2VidOneStagePipeline:
         audio_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
         images: list[ImageConditioningInput],
         enhance_prompt: bool = False,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=False)
 
@@ -134,6 +135,9 @@ class TI2VidOneStagePipeline:
             params=audio_guider_params,
             negative_context=a_context_n,
         )
+        stage_1_progress_callback = (
+            None if progress_callback is None else lambda current, total: progress_callback("stage1", current, total)
+        )
 
         def first_stage_denoising_loop(
             sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
@@ -143,6 +147,7 @@ class TI2VidOneStagePipeline:
                 video_state=video_state,
                 audio_state=audio_state,
                 stepper=stepper,
+                progress_callback=stage_1_progress_callback,
                 denoise_fn=multi_modal_guider_factory_denoising_func(
                     video_guider_factory=video_guider_factory,
                     audio_guider_factory=audio_guider_factory,

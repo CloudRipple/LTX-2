@@ -2,19 +2,23 @@ import asyncio
 import base64
 import binascii
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 import http.client
 from http.client import HTTPMessage
 import importlib
+import inspect
 import ipaddress
 from io import BytesIO
+import logging
 import mimetypes
 from pathlib import Path
 import socket
 import ssl
 import shutil
+import threading
 from typing import Any, Protocol
 from urllib.parse import ParseResult, urljoin, urlparse
 from uuid import uuid4
@@ -39,17 +43,87 @@ from .models import (
 
 UploadedImageInput = UploadedImagePayload
 
+logger = logging.getLogger(__name__)
+progress_logger = logging.getLogger("uvicorn.error")
+_tqdm_patch_lock = threading.Lock()
+_tqdm_patch_depths: dict[int, tuple[object, Any, int]] = {}
+
 
 class PipelineRunner(Protocol):
-    def generate(self, request: GenerateJobRequest, output_path: Path) -> None: ...
+    def generate(
+        self,
+        request: GenerateJobRequest,
+        output_path: Path,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> None: ...
+
+
+@dataclass
+class WorkerProgressState:
+    job_id: str
+    phase: str
+    current: int
+    total: int
+
+
+@contextmanager
+def _suppress_module_tqdm(module: object):
+    module_key = id(module)
+    with _tqdm_patch_lock:
+        patched_state = _tqdm_patch_depths.get(module_key)
+        if patched_state is None:
+            original_tqdm = getattr(module, "tqdm")
+            setattr(module, "tqdm", lambda iterable, *args, **kwargs: iterable)
+            _tqdm_patch_depths[module_key] = (module, original_tqdm, 1)
+        else:
+            stored_module, original_tqdm, depth = patched_state
+            _tqdm_patch_depths[module_key] = (stored_module, original_tqdm, depth + 1)
+    try:
+        yield
+    finally:
+        with _tqdm_patch_lock:
+            stored_module, original_tqdm, depth = _tqdm_patch_depths[module_key]
+            if depth == 1:
+                setattr(stored_module, "tqdm", original_tqdm)
+                del _tqdm_patch_depths[module_key]
+            else:
+                _tqdm_patch_depths[module_key] = (stored_module, original_tqdm, depth - 1)
+
+
+def _video_with_progress(
+    video: torch.Tensor | Any,
+    progress_callback: Callable[[str, int, int], None] | None,
+    *,
+    total_chunks: int,
+) -> torch.Tensor | Any:
+    if progress_callback is None:
+        return video
+
+    progress_callback("encode", 0, total_chunks)
+    if isinstance(video, torch.Tensor):
+        progress_callback("encode", 1, total_chunks)
+        return video
+
+    def iterator():
+        for chunk_index, chunk in enumerate(video, start=1):
+            progress_callback("encode", chunk_index, total_chunks)
+            yield chunk
+
+    return iterator()
 
 
 @dataclass
 class OneStagePipelineRunner:
     pipeline: Any
 
-    def generate(self, request: GenerateJobRequest, output_path: Path) -> None:
-        encode_video = getattr(importlib.import_module("ltx_pipelines.utils.media_io"), "encode_video")
+    def generate(
+        self,
+        request: GenerateJobRequest,
+        output_path: Path,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> None:
+        media_io_module = importlib.import_module("ltx_pipelines.utils.media_io")
+        encode_video = getattr(media_io_module, "encode_video")
 
         with torch.no_grad():
             video, audio = self.pipeline(
@@ -65,14 +139,16 @@ class OneStagePipelineRunner:
                 audio_guider_params=request.audio_guidance.to_params(),
                 images=request.to_pipeline_images(),
                 enhance_prompt=request.enhance_prompt,
+                progress_callback=progress_callback,
             )
-            encode_video(
-                video=video,
-                fps=int(request.frame_rate),
-                audio=audio,
-                output_path=output_path.as_posix(),
-                video_chunks_number=1,
-            )
+            with _suppress_module_tqdm(media_io_module):
+                encode_video(
+                    video=_video_with_progress(video, progress_callback, total_chunks=1),
+                    fps=int(request.frame_rate),
+                    audio=audio,
+                    output_path=output_path.as_posix(),
+                    video_chunks_number=1,
+                )
 
     def close(self) -> None:
         release = getattr(self.pipeline, "release_cached_models", None)
@@ -84,11 +160,17 @@ class OneStagePipelineRunner:
 class DistilledPipelineRunner:
     pipeline: Any
 
-    def generate(self, request: GenerateJobRequest, output_path: Path) -> None:
+    def generate(
+        self,
+        request: GenerateJobRequest,
+        output_path: Path,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> None:
         video_vae_module = importlib.import_module("ltx_core.model.video_vae")
         TilingConfig = getattr(video_vae_module, "TilingConfig")
         get_video_chunks_number = getattr(video_vae_module, "get_video_chunks_number")
-        encode_video = getattr(importlib.import_module("ltx_pipelines.utils.media_io"), "encode_video")
+        media_io_module = importlib.import_module("ltx_pipelines.utils.media_io")
+        encode_video = getattr(media_io_module, "encode_video")
 
         with torch.inference_mode():
             tiling_config = TilingConfig.default()
@@ -103,14 +185,16 @@ class DistilledPipelineRunner:
                 images=request.to_pipeline_images(),
                 tiling_config=tiling_config,
                 enhance_prompt=request.enhance_prompt,
+                progress_callback=progress_callback,
             )
-            encode_video(
-                video=video,
-                fps=int(request.frame_rate),
-                audio=audio,
-                output_path=output_path.as_posix(),
-                video_chunks_number=video_chunks_number,
-            )
+            with _suppress_module_tqdm(media_io_module):
+                encode_video(
+                    video=_video_with_progress(video, progress_callback, total_chunks=video_chunks_number),
+                    fps=int(request.frame_rate),
+                    audio=audio,
+                    output_path=output_path.as_posix(),
+                    video_chunks_number=video_chunks_number,
+                )
 
     def close(self) -> None:
         release = getattr(self.pipeline, "release_cached_models", None)
@@ -122,11 +206,17 @@ class DistilledPipelineRunner:
 class TwoStagePipelineRunner:
     pipeline: Any
 
-    def generate(self, request: GenerateJobRequest, output_path: Path) -> None:
+    def generate(
+        self,
+        request: GenerateJobRequest,
+        output_path: Path,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> None:
         video_vae_module = importlib.import_module("ltx_core.model.video_vae")
         TilingConfig = getattr(video_vae_module, "TilingConfig")
         get_video_chunks_number = getattr(video_vae_module, "get_video_chunks_number")
-        encode_video = getattr(importlib.import_module("ltx_pipelines.utils.media_io"), "encode_video")
+        media_io_module = importlib.import_module("ltx_pipelines.utils.media_io")
+        encode_video = getattr(media_io_module, "encode_video")
 
         with torch.inference_mode():
             tiling_config = TilingConfig.default()
@@ -145,14 +235,16 @@ class TwoStagePipelineRunner:
                 images=request.to_pipeline_images(),
                 tiling_config=tiling_config,
                 enhance_prompt=request.enhance_prompt,
+                progress_callback=progress_callback,
             )
-            encode_video(
-                video=video,
-                fps=int(request.frame_rate),
-                audio=audio,
-                output_path=output_path.as_posix(),
-                video_chunks_number=video_chunks_number,
-            )
+            with _suppress_module_tqdm(media_io_module):
+                encode_video(
+                    video=_video_with_progress(video, progress_callback, total_chunks=video_chunks_number),
+                    fps=int(request.frame_rate),
+                    audio=audio,
+                    output_path=output_path.as_posix(),
+                    video_chunks_number=video_chunks_number,
+                )
 
     def close(self) -> None:
         release = getattr(self.pipeline, "release_cached_models", None)
@@ -264,7 +356,7 @@ class PipelineServiceBackend:
     def __init__(
         self,
         config: ServiceConfig,
-        runner_factory: Callable[[], PipelineRunner] | None = None,
+        runner_factory: Callable[..., PipelineRunner] | None = None,
     ):
         self.config = config
         if runner_factory is None:
@@ -275,46 +367,51 @@ class PipelineServiceBackend:
         self._gpu_ids = config.visible_gpu_ids()
         self._execution_mode = config.resolved_execution_mode()
         self._primary_device = config.primary_device()
+        self._worker_devices = config.worker_devices()
 
-        self._runner_factory = runner_factory or partial(
-            build_default_runner,
-            config,
-            execution_mode=self._execution_mode,
-            gpu_ids=self._gpu_ids,
-            primary_device=self._primary_device,
-        )
-        self._runner: PipelineRunner | None = None
+        self._custom_runner_factory = runner_factory
+        self._runners: dict[int, PipelineRunner] = {}
         self._jobs: dict[str, JobRecord] = {}
         self._queue: asyncio.Queue[str | None] = asyncio.Queue()
-        self._worker_task: asyncio.Task[None] | None = None
+        self._worker_tasks: list[asyncio.Task[None]] = []
         self._accepting_jobs = False
+        self._progress_lock = threading.Lock()
+        self._worker_progress: dict[int, WorkerProgressState | None] = {
+            worker_index: None for worker_index, _ in enumerate(self._worker_devices)
+        }
+        self._last_progress_line: str | None = None
 
     async def start(self) -> None:
-        if self._worker_task is None:
+        if not self._worker_tasks:
             self._accepting_jobs = True
-            self._worker_task = asyncio.create_task(self._run_worker())
+            self._worker_tasks = [
+                asyncio.create_task(self._run_worker(worker_index, device))
+                for worker_index, device in enumerate(self._worker_devices)
+            ]
 
     async def shutdown(self) -> None:
-        if self._worker_task is None:
+        if not self._worker_tasks:
             return
 
         self._accepting_jobs = False
-        await self._queue.put(None)
-        await self._worker_task
-        runner = self._runner
-        self._runner = None
-        if runner is not None:
+        self._clear_all_worker_progress()
+        for _ in self._worker_tasks:
+            await self._queue.put(None)
+        await asyncio.gather(*self._worker_tasks)
+        runners = list(self._runners.values())
+        self._runners = {}
+        for runner in runners:
             close = getattr(runner, "close", None)
             if callable(close):
                 await asyncio.to_thread(close)
-        self._worker_task = None
+        self._worker_tasks = []
 
     async def submit(
         self,
         request: GenerateJobRequest,
         uploaded_files: dict[str, UploadedImagePayload] | None = None,
     ) -> JobRecord:
-        if not self._accepting_jobs or self._worker_task is None:
+        if not self._accepting_jobs or not self._worker_tasks:
             raise RuntimeError("Pipeline service backend is not accepting new jobs.")
         self._validate_request(request)
         job_id = uuid4().hex
@@ -348,19 +445,23 @@ class PipelineServiceBackend:
         return None
 
     def health(self) -> HealthResponse:
+        loaded_runner_count = len(self._runners)
         return HealthResponse(
-            pipeline_loaded=self._runner is not None,
+            pipeline_loaded=loaded_runner_count > 0,
             queue_depth=self._queue.qsize(),
             pipeline_type=self.config.pipeline_type,
             execution_mode=self._execution_mode,
             primary_device=str(self._primary_device),
             gpu_ids=list(self._gpu_ids),
+            worker_count=len(self._worker_devices),
+            loaded_runner_count=loaded_runner_count,
         )
 
-    async def _run_worker(self) -> None:
+    async def _run_worker(self, worker_index: int, device: torch.device) -> None:
         while True:
             job_id = await self._queue.get()
             if job_id is None:
+                self._set_worker_progress(worker_index, None)
                 self._queue.task_done()
                 break
             job = self._jobs[job_id]
@@ -369,10 +470,12 @@ class PipelineServiceBackend:
             cleanup_dir = self._job_input_dir(job.job_id) if job.request.requires_input_materialization() else None
             generation_error: str | None = None
             try:
+                self._report_progress(worker_index, job.job_id, "preparing", 0, 0)
                 materialized_request = await asyncio.to_thread(self._materialize_request_inputs, job)
                 job.request = materialized_request
-                runner = await asyncio.to_thread(self._ensure_runner)
-                await asyncio.to_thread(runner.generate, materialized_request, job.output_path)
+                runner = await asyncio.to_thread(self._ensure_runner, worker_index, device)
+                progress_callback = self._make_worker_progress_callback(worker_index, job.job_id)
+                await asyncio.to_thread(self._run_generation, runner, materialized_request, job.output_path, progress_callback)
             except Exception as exc:
                 generation_error = str(exc)
             finally:
@@ -386,12 +489,102 @@ class PipelineServiceBackend:
                 else:
                     job.status = JobStatus.FAILED
                     job.error = generation_error
+                self._set_worker_progress(worker_index, None)
                 self._queue.task_done()
 
-    def _ensure_runner(self) -> PipelineRunner:
-        if self._runner is None:
-            self._runner = self._runner_factory()
-        return self._runner
+    def _ensure_runner(self, worker_index: int, device: torch.device) -> PipelineRunner:
+        if worker_index not in self._runners:
+            self._runners[worker_index] = self._build_runner_for_device(worker_index, device)
+        return self._runners[worker_index]
+
+    def _build_runner_for_device(self, worker_index: int, device: torch.device) -> PipelineRunner:
+        if self._custom_runner_factory is None:
+            return build_default_runner(
+                self.config,
+                execution_mode=self._execution_mode,
+                gpu_ids=self._gpu_ids,
+                primary_device=device,
+            )
+
+        factory = self._custom_runner_factory
+        signature = inspect.signature(factory)
+        if not signature.parameters:
+            return factory()
+
+        available_kwargs = {
+            "device": device,
+            "gpu_id": self._gpu_ids[worker_index] if worker_index < len(self._gpu_ids) else None,
+            "worker_index": worker_index,
+        }
+        if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            return factory(**available_kwargs)
+
+        accepted_kwargs = {
+            name: value for name, value in available_kwargs.items() if name in signature.parameters
+        }
+        return factory(**accepted_kwargs)
+
+    def _run_generation(
+        self,
+        runner: PipelineRunner,
+        request: GenerateJobRequest,
+        output_path: Path,
+        progress_callback: Callable[[str, int, int], None],
+    ) -> None:
+        signature = inspect.signature(runner.generate)
+        if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            runner.generate(request, output_path, progress_callback=progress_callback)
+            return
+
+        if "progress_callback" in signature.parameters:
+            runner.generate(request, output_path, progress_callback=progress_callback)
+            return
+
+        runner.generate(request, output_path)
+
+    def _make_worker_progress_callback(self, worker_index: int, job_id: str) -> Callable[[str, int, int], None]:
+        def callback(phase: str, current: int, total: int) -> None:
+            self._report_progress(worker_index, job_id, phase, current, total)
+
+        return callback
+
+    def _report_progress(self, worker_index: int, job_id: str, phase: str, current: int, total: int) -> None:
+        self._set_worker_progress(
+            worker_index,
+            WorkerProgressState(job_id=job_id, phase=phase, current=current, total=total),
+        )
+
+    def _set_worker_progress(self, worker_index: int, progress: WorkerProgressState | None) -> None:
+        with self._progress_lock:
+            self._worker_progress[worker_index] = progress
+            line = self._render_worker_progress_line()
+            if line == self._last_progress_line:
+                return
+            self._last_progress_line = line
+        progress_logger.info(line)
+
+    def _clear_all_worker_progress(self) -> None:
+        with self._progress_lock:
+            for worker_index in self._worker_progress:
+                self._worker_progress[worker_index] = None
+            self._last_progress_line = None
+
+    def _render_worker_progress_line(self) -> str:
+        worker_segments = []
+        for worker_index in sorted(self._worker_progress):
+            progress = self._worker_progress[worker_index]
+            if progress is None:
+                worker_segments.append(f"w{worker_index}: idle")
+                continue
+            job_prefix = progress.job_id[:8]
+            if progress.total > 0:
+                percentage = int(progress.current * 100 / progress.total)
+                worker_segments.append(
+                    f"w{worker_index}: {job_prefix} {progress.phase} {progress.current}/{progress.total} ({percentage}%)"
+                )
+            else:
+                worker_segments.append(f"w{worker_index}: {job_prefix} {progress.phase}")
+        return "Worker progress | " + " | ".join(worker_segments)
 
     def _validate_request(self, request: GenerateJobRequest) -> None:
         if self.config.pipeline_type in {ServingPipelineType.DISTILLED, ServingPipelineType.TI2VID_TWO_STAGES}:

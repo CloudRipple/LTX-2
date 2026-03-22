@@ -2,9 +2,9 @@
 
 `ltx-service` is a standalone FastAPI wrapper around the official `ltx-pipelines` package.
 
-It keeps a single official pipeline instance warm in memory, queues requests, writes generated media to disk, and exposes a small HTTP API for submission, health checks, and job polling.
+It keeps one or more official single-device pipeline instances warm in memory, queues requests, writes generated media to disk, and exposes a small HTTP API for submission, health checks, and job polling.
 
-Unlike the earlier in-package experiments, this package treats `ltx-core` and `ltx-pipelines` as normal dependencies and does **not** require modifying their source code.
+Unlike the earlier in-package experiments, this package keeps `ltx-service` as the service entrypoint and applies only the minimal upstream `ltx-pipelines` hooks needed for runtime behavior such as progress reporting.
 
 ---
 
@@ -12,8 +12,8 @@ Unlike the earlier in-package experiments, this package treats `ltx-core` and `l
 
 - standalone service package under `packages/ltx-service`
 - wraps official `ltx_pipelines` pipeline classes directly
-- persistent in-memory pipeline instance
-- serialized job execution via an internal queue
+- persistent in-memory pipeline instance(s)
+- shared internal queue with single-runner or multi-GPU worker execution
 - image conditioning from local paths, URLs, base64 strings, and multipart file uploads
 - optional stage-boundary GPU weight retention for `ti2vid-two-stages`, plus optional inter-stage GPU cache retention for `distilled`
 - optional cross-request GPU model retention inside a single `ltx-service` process
@@ -32,6 +32,7 @@ Unlike the earlier in-package experiments, this package treats `ltx-core` and `l
 `ltx-service` currently runs the **official single-device pipeline paths**.
 
 - `--execution-mode auto` resolves to `single`
+- `--execution-mode data-parallel` starts one official single-device runner per configured GPU and balances requests through one shared queue
 - `--execution-mode sharded` is intentionally rejected in this standalone package
 
 This is deliberate: the goal of `ltx-service` is to stay a thin wrapper around the upstream pipeline implementations instead of carrying custom cross-GPU runtime modifications.
@@ -87,7 +88,7 @@ GAMMA_PATH="<gamma-path>"
   --spatial-upsampler-path "${SPATIAL_UPSAMPLER_PATH}" \
   --gamma-path "${GAMMA_PATH}" \
   --execution-mode single \
-  --gpu-ids 0 \
+  --gpu-count 1 \
   --quantization fp8-cast \
   --output-dir outputs/ltx-service
 ```
@@ -103,7 +104,7 @@ GAMMA_PATH="<gamma-path>"
   --checkpoint-path "${CHECKPOINT_PATH}" \
   --gamma-path "${GAMMA_PATH}" \
   --execution-mode single \
-  --gpu-ids 0 \
+  --gpu-count 1 \
   --quantization fp8-cast \
   --output-dir outputs/ltx-service
 ```
@@ -121,7 +122,27 @@ GAMMA_PATH="<gamma-path>"
   --spatial-upsampler-path "${SPATIAL_UPSAMPLER_PATH}" \
   --gamma-path "${GAMMA_PATH}" \
   --execution-mode single \
-  --gpu-ids 0 \
+  --gpu-count 1 \
+  --quantization fp8-cast \
+  --output-dir outputs/ltx-service
+```
+
+### 4) Data-parallel two-stage service
+
+```bash
+CHECKPOINT_PATH="<full-checkpoint-path>"
+DISTILLED_LORA_PATH="<distilled-lora-path>"
+SPATIAL_UPSAMPLER_PATH="<spatial-upsampler-path>"
+GAMMA_PATH="<gamma-path>"
+
+./.venv/bin/python -m ltx_service \
+  --pipeline-type ti2vid-two-stages \
+  --checkpoint-path "${CHECKPOINT_PATH}" \
+  --distilled-lora "${DISTILLED_LORA_PATH}" \
+  --spatial-upsampler-path "${SPATIAL_UPSAMPLER_PATH}" \
+  --gamma-path "${GAMMA_PATH}" \
+  --execution-mode data-parallel \
+  --gpu-count 2 \
   --quantization fp8-cast \
   --output-dir outputs/ltx-service
 ```
@@ -155,15 +176,20 @@ Current options:
 - `--output-dir`
 - `--host`
 - `--port`
-- `--execution-mode {auto,single,sharded}`
+- `--execution-mode {auto,single,data-parallel,sharded}`
 - `--gpu-ids [GPU_IDS ...]`
+- `--gpu-count`
 - `--keep-stage-weights-on-gpu`
 - `--keep-model-weights-on-gpu`
 
 Notes:
 
 - `auto` currently resolves to `single`
+- `data-parallel` starts one service worker per selected GPU and balances requests through a shared FIFO queue
 - `sharded` is not supported in this package
+- `--gpu-ids` takes precedence over `--gpu-count`
+- if `--gpu-ids` is omitted and `--gpu-count` is set, the service picks the first N visible GPUs automatically
+- if neither `--gpu-ids` nor `--gpu-count` is set, the service auto-detects all visible GPUs
 - `fp8-cast` takes no extra argument
 - `fp8-scaled-mm` can take an optional amax file path only when the installed `ltx-core` version supports it
 - `--keep-stage-weights-on-gpu` keeps stage weights resident for `ti2vid-two-stages`; for `distilled` it skips the inter-stage GPU cache cleanup because the same stage models are already reused
@@ -190,7 +216,9 @@ Example response:
   "pipeline_type": "ti2vid-two-stages",
   "execution_mode": "single",
   "primary_device": "cuda:0",
-  "gpu_ids": [0]
+  "gpu_ids": [0],
+  "worker_count": 1,
+  "loaded_runner_count": 0
 }
 ```
 
@@ -445,14 +473,19 @@ Use when:
 
 ## Runtime behavior
 
-`ltx-service` keeps exactly one pipeline instance alive per process.
+`ltx-service` keeps one pipeline instance per worker alive in each process.
 
 - the first request pays model-load cost
-- later requests reuse the same in-memory pipeline
-- jobs are processed **serially**
-- if one request is running, later requests remain queued
+- later requests reuse the same in-memory pipeline on that worker
+- `single` mode processes jobs **serially**
+- `data-parallel` mode runs one worker per selected GPU and pulls jobs from the same FIFO queue
+- if all workers are busy, later requests remain queued
 
-This is intentional because LTX inference is VRAM-heavy and concurrent runs would be unstable on a single device.
+This is intentional because LTX inference is VRAM-heavy: `single` mode stays conservative on one device, while `data-parallel` scales out by replicating official single-device runners across GPUs.
+
+When the service receives `Ctrl+C`, it first gives shutdown a short chance to release runners and cached weights. If the process is still stuck in in-flight work after that window, it force-exits so the service does not hang indefinitely.
+
+During server-side inference, `ltx-service` suppresses per-worker tqdm progress bars and emits aggregated `info` logs instead, so one log line can show the current progress of all active workers at once.
 
 ---
 

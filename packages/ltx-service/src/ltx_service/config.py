@@ -35,6 +35,7 @@ class ServingPipelineType(str, Enum):
 class ExecutionMode(str, Enum):
     AUTO = "auto"
     SINGLE = "single"
+    DATA_PARALLEL = "data-parallel"
     SHARDED = "sharded"
 
 
@@ -97,6 +98,7 @@ class ServiceConfig:
     port: int = 8000
     execution_mode: ExecutionMode = ExecutionMode.AUTO
     gpu_ids: tuple[int, ...] = field(default_factory=tuple)
+    gpu_count: int | None = None
     keep_stage_weights_on_gpu: bool = False
     keep_model_weights_on_gpu: bool = False
 
@@ -115,25 +117,37 @@ class ServiceConfig:
             port=args.port,
             execution_mode=ExecutionMode(args.execution_mode),
             gpu_ids=tuple(args.gpu_ids or ()),
+            gpu_count=args.gpu_count,
             keep_stage_weights_on_gpu=bool(args.keep_stage_weights_on_gpu),
             keep_model_weights_on_gpu=bool(args.keep_model_weights_on_gpu),
         )
 
     def visible_gpu_ids(self) -> tuple[int, ...]:
         if not torch.cuda.is_available():
-            if self.gpu_ids:
-                raise ValueError("GPU ids were provided, but CUDA is not available.")
+            if self.gpu_ids or self.gpu_count is not None:
+                raise ValueError("GPU ids or gpu_count were provided, but CUDA is not available.")
             return ()
 
         device_count = torch.cuda.device_count()
-        if not self.gpu_ids:
-            return tuple(range(device_count))
+        if self.gpu_ids:
+            invalid_gpu_ids = tuple(gpu_id for gpu_id in self.gpu_ids if gpu_id < 0 or gpu_id >= device_count)
+            if invalid_gpu_ids:
+                raise ValueError(f"Invalid GPU ids requested: {invalid_gpu_ids}.")
 
-        invalid_gpu_ids = tuple(gpu_id for gpu_id in self.gpu_ids if gpu_id < 0 or gpu_id >= device_count)
-        if invalid_gpu_ids:
-            raise ValueError(f"Invalid GPU ids requested: {invalid_gpu_ids}.")
+            duplicate_gpu_ids = tuple(gpu_id for gpu_id in self.gpu_ids if self.gpu_ids.count(gpu_id) > 1)
+            if duplicate_gpu_ids:
+                raise ValueError(f"Duplicate GPU ids requested: {tuple(dict.fromkeys(duplicate_gpu_ids))}.")
 
-        return self.gpu_ids
+            return self.gpu_ids
+
+        if self.gpu_count is not None:
+            if self.gpu_count <= 0:
+                raise ValueError("gpu_count must be positive when provided.")
+            if self.gpu_count > device_count:
+                raise ValueError(f"gpu_count {self.gpu_count} exceeds visible GPU count {device_count}.")
+            return tuple(range(self.gpu_count))
+
+        return tuple(range(device_count))
 
     def resolved_execution_mode(self) -> ExecutionMode:
         if self.execution_mode is ExecutionMode.AUTO:
@@ -147,6 +161,12 @@ class ServiceConfig:
         if visible_gpu_ids:
             return torch.device(f"cuda:{visible_gpu_ids[0]}")
         return torch.device("cpu")
+
+    def worker_devices(self) -> tuple[torch.device, ...]:
+        visible_gpu_ids = self.visible_gpu_ids()
+        if self.resolved_execution_mode() is ExecutionMode.DATA_PARALLEL and visible_gpu_ids:
+            return tuple(torch.device(f"cuda:{gpu_id}") for gpu_id in visible_gpu_ids)
+        return (self.primary_device(),)
 
     def require_cuda_for_official_pipelines(self) -> None:
         if not torch.cuda.is_available():
@@ -237,14 +257,23 @@ def build_service_arg_parser() -> argparse.ArgumentParser:
         "--execution-mode",
         choices=[mode.value for mode in ExecutionMode],
         default=ExecutionMode.AUTO.value,
-        help="Execution mode. Standalone service currently supports only single-device official pipelines.",
+        help=(
+            "Execution mode. auto resolves to single, data-parallel starts one single-device runner per selected GPU, "
+            "and sharded remains unsupported in this standalone service."
+        ),
     )
     parser.add_argument(
         "--gpu-ids",
         type=int,
         nargs="*",
         default=None,
-        help="Optional subset of visible CUDA device ids to use, for example: --gpu-ids 0.",
+        help="Optional explicit CUDA device ids to use. When set, this takes precedence over --gpu-count.",
+    )
+    parser.add_argument(
+        "--gpu-count",
+        type=int,
+        default=None,
+        help="Optional number of GPUs to use from the visible CUDA set. If omitted, all visible GPUs are auto-detected.",
     )
     parser.add_argument(
         "--keep-stage-weights-on-gpu",

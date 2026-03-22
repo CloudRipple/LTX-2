@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import torch
 
@@ -89,6 +89,7 @@ class DistilledPipeline:
         images: list[ImageConditioningInput],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -106,6 +107,12 @@ class DistilledPipeline:
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
         if audio_context is None:
             raise ValueError("Prompt encoding must provide audio context for distilled generation.")
+        stage_1_progress_callback = (
+            None if progress_callback is None else lambda current, total: progress_callback("stage1", current, total)
+        )
+        stage_2_progress_callback = (
+            None if progress_callback is None else lambda current, total: progress_callback("stage2", current, total)
+        )
 
         # Stage 1: Initial low resolution video generation.
         video_encoder = self.model_ledger.video_encoder()
@@ -113,13 +120,18 @@ class DistilledPipeline:
         stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
 
         def denoising_loop(
-            sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
+            sigmas: torch.Tensor,
+            video_state: LatentState,
+            audio_state: LatentState,
+            stepper: DiffusionStepProtocol,
+            progress_step_callback: Callable[[int, int], None] | None,
         ) -> tuple[LatentState, LatentState]:
             return euler_denoising_loop(
                 sigmas=sigmas,
                 video_state=video_state,
                 audio_state=audio_state,
                 stepper=stepper,
+                progress_callback=progress_step_callback,
                 denoise_fn=simple_denoising_func(
                     video_context=video_context,
                     audio_context=audio_context,
@@ -149,7 +161,9 @@ class DistilledPipeline:
             noiser=noiser,
             sigmas=stage_1_sigmas,
             stepper=stepper,
-            denoising_loop_fn=denoising_loop,
+            denoising_loop_fn=lambda sigmas, video_state, audio_state, stepper: denoising_loop(
+                sigmas, video_state, audio_state, stepper, stage_1_progress_callback
+            ),
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
@@ -180,7 +194,9 @@ class DistilledPipeline:
             noiser=noiser,
             sigmas=stage_2_sigmas,
             stepper=stepper,
-            denoising_loop_fn=denoising_loop,
+            denoising_loop_fn=lambda sigmas, video_state, audio_state, stepper: denoising_loop(
+                sigmas, video_state, audio_state, stepper, stage_2_progress_callback
+            ),
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,

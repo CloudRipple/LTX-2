@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import torch
 
@@ -99,6 +99,7 @@ class TI2VidTwoStagesPipeline:
         images: list[ImageConditioningInput],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -118,6 +119,12 @@ class TI2VidTwoStagesPipeline:
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
         if a_context_p is None or a_context_n is None:
             raise ValueError("Prompt encoding must provide audio context for two-stage generation.")
+        stage_1_progress_callback = (
+            None if progress_callback is None else lambda current, total: progress_callback("stage1", current, total)
+        )
+        stage_2_progress_callback = (
+            None if progress_callback is None else lambda current, total: progress_callback("stage2", current, total)
+        )
 
         # Stage 1: encode image conditionings with the VAE encoder, then free it
         # before loading the transformer to reduce peak VRAM.
@@ -157,6 +164,7 @@ class TI2VidTwoStagesPipeline:
                 video_state=video_state,
                 audio_state=audio_state,
                 stepper=stepper,
+                progress_callback=stage_1_progress_callback,
                 denoise_fn=multi_modal_guider_factory_denoising_func(
                     video_guider_factory=create_multimodal_guider_factory(
                         params=video_guider_params,
@@ -221,6 +229,7 @@ class TI2VidTwoStagesPipeline:
                 video_state=video_state,
                 audio_state=audio_state,
                 stepper=stepper,
+                progress_callback=stage_2_progress_callback,
                 denoise_fn=simple_denoising_func(
                     video_context=v_context_p,
                     audio_context=a_context_p,
