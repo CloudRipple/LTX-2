@@ -38,6 +38,8 @@ from .models import (
     UPLOAD_SOURCE_PREFIX,
     UploadedImagePayload,
     VideoGenerationResponse,
+    WorkerErrorResponse,
+    WorkerStatusResponse,
 )
 
 
@@ -263,12 +265,14 @@ class JobRecord:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     error: str | None = None
+    worker_error: WorkerErrorResponse | None = None
 
     def to_generation_response(self) -> VideoGenerationResponse:
         return VideoGenerationResponse(
             id=self.job_id,
             status=self.status,
             error=self.error,
+            worker_error=self.worker_error,
             created_at=int(self.created_at.timestamp()),
             started_at=int(self.started_at.timestamp()) if self.started_at is not None else None,
             finished_at=int(self.finished_at.timestamp()) if self.finished_at is not None else None,
@@ -379,6 +383,9 @@ class PipelineServiceBackend:
         self._worker_progress: dict[int, WorkerProgressState | None] = {
             worker_index: None for worker_index, _ in enumerate(self._worker_devices)
         }
+        self._worker_errors: dict[int, WorkerErrorResponse | None] = {
+            worker_index: None for worker_index, _ in enumerate(self._worker_devices)
+        }
         self._last_progress_line: str | None = None
 
     async def start(self) -> None:
@@ -446,7 +453,9 @@ class PipelineServiceBackend:
 
     def health(self) -> HealthResponse:
         loaded_runner_count = len(self._runners)
+        workers = self._worker_statuses()
         return HealthResponse(
+            status="degraded" if any(worker.status == "error" for worker in workers) else "ok",
             pipeline_loaded=loaded_runner_count > 0,
             queue_depth=self._queue.qsize(),
             pipeline_type=self.config.pipeline_type,
@@ -455,6 +464,7 @@ class PipelineServiceBackend:
             gpu_ids=list(self._gpu_ids),
             worker_count=len(self._worker_devices),
             loaded_runner_count=loaded_runner_count,
+            workers=workers,
         )
 
     async def _run_worker(self, worker_index: int, device: torch.device) -> None:
@@ -469,15 +479,31 @@ class PipelineServiceBackend:
             job.started_at = _utcnow()
             cleanup_dir = self._job_input_dir(job.job_id) if job.request.requires_input_materialization() else None
             generation_error: str | None = None
+            worker_error: WorkerErrorResponse | None = None
+            failure_phase = "materialize_inputs"
+            quarantine_worker = False
             try:
                 self._report_progress(worker_index, job.job_id, "preparing", 0, 0)
                 materialized_request = await asyncio.to_thread(self._materialize_request_inputs, job)
                 job.request = materialized_request
+                self._report_progress(worker_index, job.job_id, "loading_runner", 0, 0)
+                failure_phase = "runner_init"
                 runner = await asyncio.to_thread(self._ensure_runner, worker_index, device)
+                self._report_progress(worker_index, job.job_id, "generating", 0, 0)
+                failure_phase = "generation"
                 progress_callback = self._make_worker_progress_callback(worker_index, job.job_id)
                 await asyncio.to_thread(self._run_generation, runner, materialized_request, job.output_path, progress_callback)
             except Exception as exc:
-                generation_error = str(exc)
+                worker_error = self._build_worker_error(worker_index, device, failure_phase, exc)
+                generation_error = self._format_worker_error(worker_error)
+                quarantine_worker = failure_phase == "runner_init" and worker_index not in self._runners
+                logger.exception(
+                    "Worker %s on %s failed during %s for job %s.",
+                    worker_index,
+                    worker_error.device,
+                    failure_phase,
+                    job.job_id,
+                )
             finally:
                 job.uploaded_files = {}
                 if cleanup_dir is not None:
@@ -486,11 +512,22 @@ class PipelineServiceBackend:
                 if generation_error is None:
                     job.status = JobStatus.SUCCEEDED
                     job.error = None
+                    job.worker_error = None
+                    self._set_worker_error(worker_index, None)
                 else:
                     job.status = JobStatus.FAILED
                     job.error = generation_error
+                    job.worker_error = worker_error
+                    self._set_worker_error(worker_index, worker_error)
                 self._set_worker_progress(worker_index, None)
                 self._queue.task_done()
+            if quarantine_worker:
+                logger.error(
+                    "Worker %s on %s entered persistent error state and will stop consuming new jobs.",
+                    worker_index,
+                    str(device),
+                )
+                break
 
     def _ensure_runner(self, worker_index: int, device: torch.device) -> PipelineRunner:
         if worker_index not in self._runners:
@@ -548,6 +585,37 @@ class PipelineServiceBackend:
 
         return callback
 
+    def _gpu_id_for_worker(self, worker_index: int) -> int | None:
+        return self._gpu_ids[worker_index] if worker_index < len(self._gpu_ids) else None
+
+    def _build_worker_error(
+        self,
+        worker_index: int,
+        device: torch.device,
+        phase: str,
+        exc: Exception,
+    ) -> WorkerErrorResponse:
+        message = str(exc).strip() or type(exc).__name__
+        return WorkerErrorResponse(
+            worker_index=worker_index,
+            gpu_id=self._gpu_id_for_worker(worker_index),
+            device=str(device),
+            phase=phase,
+            error_type=type(exc).__name__,
+            message=message,
+        )
+
+    def _format_worker_error(self, worker_error: WorkerErrorResponse) -> str:
+        location = f"Worker {worker_error.worker_index}"
+        if worker_error.gpu_id is not None:
+            location += f" (gpu {worker_error.gpu_id}, {worker_error.device})"
+        else:
+            location += f" ({worker_error.device})"
+        return (
+            f"{location} failed during {worker_error.phase}: "
+            f"{worker_error.error_type}: {worker_error.message}"
+        )
+
     def _report_progress(self, worker_index: int, job_id: str, phase: str, current: int, total: int) -> None:
         self._set_worker_progress(
             worker_index,
@@ -568,6 +636,44 @@ class PipelineServiceBackend:
             for worker_index in self._worker_progress:
                 self._worker_progress[worker_index] = None
             self._last_progress_line = None
+
+    def _set_worker_error(self, worker_index: int, worker_error: WorkerErrorResponse | None) -> None:
+        with self._progress_lock:
+            self._worker_errors[worker_index] = worker_error
+
+    def _worker_statuses(self) -> list[WorkerStatusResponse]:
+        with self._progress_lock:
+            progress_snapshot = dict(self._worker_progress)
+            error_snapshot = dict(self._worker_errors)
+
+        workers = []
+        for worker_index, device in enumerate(self._worker_devices):
+            progress = progress_snapshot[worker_index]
+            error = error_snapshot[worker_index]
+            runner_loaded = worker_index in self._runners
+
+            if progress is not None:
+                status = "running"
+            elif error is not None and error.phase == "runner_init" and not runner_loaded:
+                status = "error"
+            elif runner_loaded:
+                status = "ready"
+            else:
+                status = "idle"
+
+            workers.append(
+                WorkerStatusResponse(
+                    worker_index=worker_index,
+                    gpu_id=self._gpu_id_for_worker(worker_index),
+                    device=str(device),
+                    status=status,
+                    runner_loaded=runner_loaded,
+                    current_job_id=progress.job_id if progress is not None else None,
+                    current_phase=progress.phase if progress is not None else None,
+                    error=error,
+                )
+            )
+        return workers
 
     def _render_worker_progress_line(self) -> str:
         worker_segments = []

@@ -246,11 +246,32 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+class WorkerErrorResponse(BaseModel):
+    worker_index: int
+    gpu_id: int | None = None
+    device: str
+    phase: str
+    error_type: str
+    message: str
+
+
+class WorkerStatusResponse(BaseModel):
+    worker_index: int
+    gpu_id: int | None = None
+    device: str
+    status: str
+    runner_loaded: bool
+    current_job_id: str | None = None
+    current_phase: str | None = None
+    error: WorkerErrorResponse | None = None
+
+
 class VideoGenerationResponse(BaseModel):
     id: str
     object: str = "video.generation"
     status: JobStatus
     error: str | None = None
+    worker_error: WorkerErrorResponse | None = None
     created_at: int
     started_at: int | None = None
     finished_at: int | None = None
@@ -275,6 +296,7 @@ class HealthResponse(BaseModel):
     gpu_ids: list[int] = Field(default_factory=list)
     worker_count: int
     loaded_runner_count: int
+    workers: list[WorkerStatusResponse] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)

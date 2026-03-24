@@ -455,6 +455,7 @@ def test_data_parallel_backend_balances_jobs_across_gpu_workers(monkeypatch, tmp
             assert health.worker_count == 2
             assert health.loaded_runner_count == 0
             assert health.pipeline_loaded is False
+            assert [worker.status for worker in health.workers] == ["idle", "idle"]
 
             first_job = await backend.submit(GenerateJobRequest(prompt="first"))
             second_job = await backend.submit(GenerateJobRequest(prompt="second"))
@@ -466,6 +467,7 @@ def test_data_parallel_backend_balances_jobs_across_gpu_workers(monkeypatch, tmp
             assert health.worker_count == 2
             assert health.loaded_runner_count == 2
             assert health.pipeline_loaded is True
+            assert {worker.status for worker in health.workers} == {"running"}
             assert max_active_workers == 2
             assert {worker for prompt, worker in seen_workers if prompt in {"first", "second"}} == {0, 1}
 
@@ -681,6 +683,15 @@ def test_fastapi_endpoints_report_health_and_job_status(tmp_path: Path) -> None:
         assert health_response.json()["pipeline_loaded"] is False
         assert health_response.json()["worker_count"] == 1
         assert health_response.json()["loaded_runner_count"] == 0
+        first_worker = health_response.json()["workers"][0]
+        assert first_worker["worker_index"] == 0
+        assert first_worker["device"] == health_response.json()["primary_device"]
+        assert first_worker["gpu_id"] == (health_response.json()["gpu_ids"][0] if health_response.json()["gpu_ids"] else None)
+        assert first_worker["status"] == "idle"
+        assert first_worker["runner_loaded"] is False
+        assert first_worker["current_job_id"] is None
+        assert first_worker["current_phase"] is None
+        assert first_worker["error"] is None
 
         first_submit = client.post("/v1/videos", json={"prompt": "hello world"}).json()
         first_job_id = str(first_submit["id"])
@@ -708,6 +719,15 @@ def test_fastapi_endpoints_report_health_and_job_status(tmp_path: Path) -> None:
         assert health_response.json()["pipeline_loaded"] is True
         assert health_response.json()["worker_count"] == 1
         assert health_response.json()["loaded_runner_count"] == 1
+        first_worker = health_response.json()["workers"][0]
+        assert first_worker["worker_index"] == 0
+        assert first_worker["device"] == health_response.json()["primary_device"]
+        assert first_worker["gpu_id"] == (health_response.json()["gpu_ids"][0] if health_response.json()["gpu_ids"] else None)
+        assert first_worker["status"] == "ready"
+        assert first_worker["runner_loaded"] is True
+        assert first_worker["current_job_id"] is None
+        assert first_worker["current_phase"] is None
+        assert first_worker["error"] is None
 
         missing_generation_response = client.get("/v1/videos/missing-job")
         assert missing_generation_response.status_code == 404
@@ -1424,6 +1444,157 @@ def test_failed_job_file_endpoints_return_gone(tmp_path: Path) -> None:
     assert "File is unavailable because generation failed." in file_content.text
 
 
+def test_fastapi_exposes_data_parallel_worker_errors_in_health_and_failed_job_response(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    worker_zero_started = threading.Event()
+    release_worker_zero = threading.Event()
+
+    class BlockingRunner:
+        def generate(self, request, output_path: Path) -> None:
+            _ = request
+            worker_zero_started.set()
+            release_worker_zero.wait(timeout=1.0)
+            _ = output_path.write_text("worker-zero")
+
+    def build_runner(*, worker_index: int, device: torch.device, gpu_id: int | None = None):
+        _ = device
+        if worker_index == 1:
+            raise FileNotFoundError("missing checkpoint path /models/missing.safetensors")
+        assert gpu_id == 0
+        return BlockingRunner()
+
+    config = _make_test_config(tmp_path, execution_mode=ExecutionMode.DATA_PARALLEL)
+    backend = PipelineServiceBackend(config=config, runner_factory=build_runner)
+    app = create_app(config, backend=backend)
+
+    with TestClient(app) as client:
+        first_submit = client.post("/v1/videos", json={"prompt": "first", "num_frames": 9}).json()
+        second_submit = client.post("/v1/videos", json={"prompt": "second", "num_frames": 9}).json()
+        job_ids = [str(first_submit["id"]), str(second_submit["id"])]
+
+        deadline = time.monotonic() + 2.0
+        failed_job: dict[str, object] | None = None
+        while time.monotonic() < deadline:
+            for job_id in job_ids:
+                payload = client.get(f"/v1/videos/{job_id}").json()
+                if payload["status"] == JobStatus.FAILED.value:
+                    failed_job = payload
+                    break
+            if failed_job is not None:
+                break
+            time.sleep(0.01)
+
+        assert failed_job is not None
+        assert failed_job["worker_error"] == {
+            "worker_index": 1,
+            "gpu_id": 1,
+            "device": "cuda:1",
+            "phase": "runner_init",
+            "error_type": "FileNotFoundError",
+            "message": "missing checkpoint path /models/missing.safetensors",
+        }
+        assert "Worker 1 (gpu 1, cuda:1) failed during runner_init" in str(failed_job["error"])
+        assert "FileNotFoundError" in str(failed_job["error"])
+        assert worker_zero_started.wait(timeout=1.0)
+
+        health_response = client.get("/health")
+        assert health_response.status_code == 200
+        assert health_response.json()["status"] == "degraded"
+        assert health_response.json()["loaded_runner_count"] == 1
+        assert health_response.json()["workers"] == [
+            {
+                "worker_index": 0,
+                "gpu_id": 0,
+                "device": "cuda:0",
+                "status": "running",
+                "runner_loaded": True,
+                "current_job_id": job_ids[0] if job_ids[0] != failed_job["id"] else job_ids[1],
+                "current_phase": "generating",
+                "error": None,
+            },
+            {
+                "worker_index": 1,
+                "gpu_id": 1,
+                "device": "cuda:1",
+                "status": "error",
+                "runner_loaded": False,
+                "current_job_id": None,
+                "current_phase": None,
+                "error": {
+                    "worker_index": 1,
+                    "gpu_id": 1,
+                    "device": "cuda:1",
+                    "phase": "runner_init",
+                    "error_type": "FileNotFoundError",
+                    "message": "missing checkpoint path /models/missing.safetensors",
+                },
+            },
+        ]
+
+        release_worker_zero.set()
+        remaining_job_id = next(job_id for job_id in job_ids if job_id != failed_job["id"])
+        remaining_job = _wait_for_generation_via_api(client, remaining_job_id)
+        assert remaining_job["status"] == JobStatus.SUCCEEDED.value
+
+
+def test_data_parallel_worker_runner_init_failure_stops_consuming_future_jobs(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    worker_zero_started = threading.Event()
+    release_worker_zero = threading.Event()
+    seen_prompts: list[str] = []
+
+    class BlockingRunner:
+        def generate(self, request, output_path: Path) -> None:
+            seen_prompts.append(request.prompt)
+            worker_zero_started.set()
+            release_worker_zero.wait(timeout=1.0)
+            _ = output_path.write_text(f"worker-0:{request.prompt}")
+
+    def build_runner(*, worker_index: int, **kwargs):
+        _ = kwargs
+        if worker_index == 1:
+            raise FileNotFoundError("missing checkpoint path /models/missing.safetensors")
+        return BlockingRunner()
+
+    backend = PipelineServiceBackend(
+        config=_make_test_config(tmp_path, execution_mode=ExecutionMode.DATA_PARALLEL),
+        runner_factory=build_runner,
+    )
+
+    async def scenario() -> None:
+        await backend.start()
+        try:
+            first_job = await backend.submit(GenerateJobRequest(prompt="first"))
+            second_job = await backend.submit(GenerateJobRequest(prompt="second"))
+            assert await asyncio.to_thread(worker_zero_started.wait, 1.0)
+
+            failed_job = await _wait_for_one_of_jobs(backend, (first_job.job_id, second_job.job_id), JobStatus.FAILED)
+            health = backend.health()
+            assert health.status == "degraded"
+            assert health.workers[1].status == "error"
+
+            third_job = await backend.submit(GenerateJobRequest(prompt="third"))
+            await asyncio.sleep(0.05)
+            assert backend.get_job(third_job.job_id).status is JobStatus.QUEUED
+
+            release_worker_zero.set()
+
+            await _wait_for_one_of_jobs(backend, (first_job.job_id, second_job.job_id), JobStatus.SUCCEEDED)
+            third_record = await _wait_for_job(backend, third_job.job_id, JobStatus.SUCCEEDED)
+
+            assert third_record.output_path.read_text() == "worker-0:third"
+            assert seen_prompts[-1] == "third"
+            assert backend.get_job(failed_job.job_id).worker_error is not None
+        finally:
+            await backend.shutdown()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "image_payload",
     [
@@ -1531,6 +1702,17 @@ async def _wait_for_job(backend, job_id: str, status):
             return job
         await asyncio.sleep(0.01)
     raise AssertionError(f"Timed out waiting for job {job_id} to reach {status.value}.")
+
+
+async def _wait_for_one_of_jobs(backend, job_ids: tuple[str, ...], status):
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        for job_id in job_ids:
+            job = backend.get_job(job_id)
+            if job is not None and job.status is status:
+                return job
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"Timed out waiting for one of {job_ids} to reach {status.value}.")
 
 
 def _wait_for_generation_via_api(client: TestClient, job_id: str) -> dict[str, object]:
