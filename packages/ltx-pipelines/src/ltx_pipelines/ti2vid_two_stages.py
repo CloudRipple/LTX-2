@@ -12,7 +12,7 @@ from ltx_core.components.guiders import (
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
-from ltx_core.loader import LoraPathStrengthAndSDOps
+from ltx_core.loader import LoraPathStrengthAndSDOps, Registry
 from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
@@ -59,6 +59,7 @@ class TI2VidTwoStagesPipeline:
         quantization: QuantizationPolicy | None = None,
         keep_stage_weights_on_gpu: bool = False,
         keep_model_weights_on_gpu: bool = False,
+        registry: Registry | None = None,
     ):
         self.device = device
         self.dtype = torch.bfloat16
@@ -71,6 +72,7 @@ class TI2VidTwoStagesPipeline:
             gemma_root_path=gemma_root,
             spatial_upsampler_path=spatial_upsampler_path,
             loras=loras,
+            registry=registry,
             cache_models=keep_model_weights_on_gpu,
             quantization=quantization,
         )
@@ -83,6 +85,34 @@ class TI2VidTwoStagesPipeline:
             dtype=self.dtype,
             device=device,
         )
+
+    def preload_weights(self) -> None:
+        if self.keep_model_weights_on_gpu:
+            self.stage_1_model_ledger.preload_models(
+                (
+                    "text_encoder",
+                    "gemma_embeddings_processor",
+                    "video_encoder",
+                    "transformer",
+                )
+            )
+            self.stage_2_model_ledger.preload_models(
+                (
+                    "transformer",
+                    "spatial_upsampler",
+                    "video_decoder",
+                    "audio_decoder",
+                    "vocoder",
+                )
+            )
+            return
+
+        self.stage_1_model_ledger.preload_state_dicts()
+        self.stage_2_model_ledger.preload_state_dicts()
+
+    def release_startup_weight_cache(self) -> None:
+        self.stage_1_model_ledger.release_state_dict_registry()
+        self.stage_2_model_ledger.release_state_dict_registry()
 
     def __call__(  # noqa: PLR0913
         self,

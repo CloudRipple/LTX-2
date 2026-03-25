@@ -12,7 +12,7 @@ from ltx_core.components.guiders import (
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
-from ltx_core.loader import LoraPathStrengthAndSDOps
+from ltx_core.loader import LoraPathStrengthAndSDOps, Registry
 from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
@@ -54,6 +54,7 @@ class TI2VidOneStagePipeline:
         quantization: QuantizationPolicy | None = None,
         keep_stage_weights_on_gpu: bool = False,
         keep_model_weights_on_gpu: bool = False,
+        registry: Registry | None = None,
     ):
         self.dtype = torch.bfloat16
         self.device = device
@@ -65,6 +66,7 @@ class TI2VidOneStagePipeline:
             checkpoint_path=checkpoint_path,
             gemma_root_path=gemma_root,
             loras=loras,
+            registry=registry,
             cache_models=keep_model_weights_on_gpu,
             quantization=quantization,
         )
@@ -72,6 +74,26 @@ class TI2VidOneStagePipeline:
             dtype=self.dtype,
             device=device,
         )
+
+    def preload_weights(self) -> None:
+        if self.keep_model_weights_on_gpu:
+            self.model_ledger.preload_models(
+                (
+                    "text_encoder",
+                    "gemma_embeddings_processor",
+                    "video_encoder",
+                    "transformer",
+                    "video_decoder",
+                    "audio_decoder",
+                    "vocoder",
+                )
+            )
+            return
+
+        self.model_ledger.preload_state_dicts()
+
+    def release_startup_weight_cache(self) -> None:
+        self.model_ledger.release_state_dict_registry()
 
     def __call__(  # noqa: PLR0913
         self,

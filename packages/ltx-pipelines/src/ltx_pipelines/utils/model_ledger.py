@@ -232,41 +232,105 @@ class ModelLedger:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
-    def transformer(self) -> X0Model:
+    def release_state_dict_registry(self) -> None:
+        dummy_registry = DummyRegistry()
+        self.registry = dummy_registry
+
+        for builder_name in (
+            "transformer_builder",
+            "vae_decoder_builder",
+            "vae_encoder_builder",
+            "audio_encoder_builder",
+            "audio_decoder_builder",
+            "vocoder_builder",
+            "embeddings_processor_builder",
+            "text_encoder_builder",
+            "upsampler_builder",
+        ):
+            builder = getattr(self, builder_name, None)
+            if builder is None or not hasattr(builder, "registry"):
+                continue
+            setattr(self, builder_name, replace(builder, registry=dummy_registry))
+
+    def preload_state_dicts(self) -> None:
+        preload_device = self._target_device()
+        transformer_builder = self._effective_transformer_builder()
+        transformer_preload = getattr(transformer_builder, "preload", None)
+        if callable(transformer_preload):
+            transformer_preload(device=preload_device)
+
+        for builder_name in (
+            "vae_decoder_builder",
+            "vae_encoder_builder",
+            "audio_encoder_builder",
+            "audio_decoder_builder",
+            "vocoder_builder",
+            "embeddings_processor_builder",
+            "text_encoder_builder",
+            "upsampler_builder",
+        ):
+            builder = getattr(self, builder_name, None)
+            preload = getattr(builder, "preload", None)
+            if callable(preload):
+                preload(device=preload_device)
+
+    def preload_models(self, model_names: tuple[str, ...]) -> None:
+        for model_name in model_names:
+            getattr(self, model_name)()
+
+    def _effective_transformer_builder(self) -> Any:
         if not hasattr(self, "transformer_builder"):
             raise ValueError(
                 "Transformer not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
 
         if self.quantization is None:
+            return self.transformer_builder
+
+        sd_ops = self.transformer_builder.model_sd_ops
+        quantization_sd_ops = self.quantization.sd_ops
+        if quantization_sd_ops is not None:
+            if sd_ops is None:
+                sd_ops = quantization_sd_ops
+            else:
+                sd_ops = SDOps(
+                    name=f"sd_ops_chain_{sd_ops.name}+{quantization_sd_ops.name}",
+                    mapping=(*sd_ops.mapping, *quantization_sd_ops.mapping),
+                )
+
+        return replace(
+            self.transformer_builder,
+            module_ops=(*self.transformer_builder.module_ops, *self.quantization.module_ops),
+            model_sd_ops=sd_ops,
+        )
+
+    def _transformer_build_device(self) -> torch.device:
+        target_device = self._target_device()
+        if (
+            isinstance(self.registry, DummyRegistry)
+            and self.device.type == "cuda"
+            and bool(self.loras)
+            and self.quantization is not None
+        ):
+            return torch.device("cpu")
+        return target_device
+
+    def transformer(self) -> X0Model:
+        builder = self._effective_transformer_builder()
+        build_device = self._transformer_build_device()
+        if self.quantization is None:
             return self._maybe_cached(
                 "transformer",
                 lambda: (
-                X0Model(self.transformer_builder.build(device=self._target_device(), dtype=self.dtype))
+                X0Model(builder.build(device=build_device, dtype=self.dtype))
                 .to(self.device)
                 .eval()
                 ),
             )
-        else:
-            sd_ops = self.transformer_builder.model_sd_ops
-            quantization_sd_ops = self.quantization.sd_ops
-            if quantization_sd_ops is not None:
-                if sd_ops is None:
-                    sd_ops = quantization_sd_ops
-                else:
-                    sd_ops = SDOps(
-                        name=f"sd_ops_chain_{sd_ops.name}+{quantization_sd_ops.name}",
-                        mapping=(*sd_ops.mapping, *quantization_sd_ops.mapping),
-                    )
-            builder = replace(
-                self.transformer_builder,
-                module_ops=(*self.transformer_builder.module_ops, *self.quantization.module_ops),
-                model_sd_ops=sd_ops,
-            )
-            return self._maybe_cached(
-                "transformer",
-                lambda: X0Model(builder.build(device=self._target_device())).to(self.device).eval(),
-            )
+        return self._maybe_cached(
+            "transformer",
+            lambda: X0Model(builder.build(device=build_device)).to(self.device).eval(),
+        )
 
     def video_decoder(self) -> VideoDecoder:
         if not hasattr(self, "vae_decoder_builder"):
