@@ -253,6 +253,7 @@ def test_build_default_runner_passes_keep_stage_weights_flag(monkeypatch, tmp_pa
         "ltx_core.loader": SimpleNamespace(
             LTXV_LORA_COMFY_RENAMING_MAP=object(),
             LoraPathStrengthAndSDOps=DummyLora,
+            StateDictRegistry=lambda: object(),
         ),
         "ltx_pipelines.ti2vid_one_stage": SimpleNamespace(TI2VidOneStagePipeline=DummyPipeline),
         "ltx_pipelines.distilled": SimpleNamespace(DistilledPipeline=DummyPipeline),
@@ -296,6 +297,7 @@ def test_build_default_runner_passes_keep_model_weights_flag(monkeypatch, tmp_pa
         "ltx_core.loader": SimpleNamespace(
             LTXV_LORA_COMFY_RENAMING_MAP=object(),
             LoraPathStrengthAndSDOps=DummyLora,
+            StateDictRegistry=lambda: object(),
         ),
         "ltx_pipelines.ti2vid_one_stage": SimpleNamespace(TI2VidOneStagePipeline=DummyPipeline),
         "ltx_pipelines.distilled": SimpleNamespace(DistilledPipeline=DummyPipeline),
@@ -314,6 +316,97 @@ def test_build_default_runner_passes_keep_model_weights_flag(monkeypatch, tmp_pa
 
     assert runner is not None
     assert seen[expected_constructor]["keep_model_weights_on_gpu"] is True
+    assert seen[expected_constructor]["registry"] is None
+
+
+@pytest.mark.parametrize(
+    ("pipeline_type", "expected_constructor"),
+    [
+        (ServingPipelineType.TI2VID_ONE_STAGE, "one_stage"),
+        (ServingPipelineType.DISTILLED, "distilled"),
+        (ServingPipelineType.TI2VID_TWO_STAGES, "two_stage"),
+    ],
+)
+def test_build_default_runner_passes_shared_weight_registry(monkeypatch, tmp_path: Path, pipeline_type, expected_constructor) -> None:
+    seen: dict[str, dict[str, object]] = {}
+    shared_registry = object()
+
+    class DummyPipeline:
+        def __init__(self, **kwargs):
+            seen[expected_constructor] = kwargs
+
+    class DummyLora:
+        def __init__(self, *args):
+            self.args = args
+
+    modules = {
+        "ltx_core.loader": SimpleNamespace(
+            LTXV_LORA_COMFY_RENAMING_MAP=object(),
+            LoraPathStrengthAndSDOps=DummyLora,
+            StateDictRegistry=lambda: object(),
+        ),
+        "ltx_pipelines.ti2vid_one_stage": SimpleNamespace(TI2VidOneStagePipeline=DummyPipeline),
+        "ltx_pipelines.distilled": SimpleNamespace(DistilledPipeline=DummyPipeline),
+        "ltx_pipelines.ti2vid_two_stages": SimpleNamespace(TI2VidTwoStagesPipeline=DummyPipeline),
+    }
+
+    monkeypatch.setattr(backend_module.importlib, "import_module", lambda name: modules[name])
+
+    runner = backend_module.build_default_runner(
+        _make_test_config(tmp_path, pipeline_type=pipeline_type),
+        execution_mode=ExecutionMode.SINGLE,
+        gpu_ids=(0,),
+        primary_device=torch.device("cuda:0"),
+        registry=shared_registry,
+    )
+
+    assert runner is not None
+    assert seen[expected_constructor]["registry"] is shared_registry
+
+
+@pytest.mark.parametrize(
+    ("pipeline_type", "expected_constructor"),
+    [
+        (ServingPipelineType.TI2VID_ONE_STAGE, "one_stage"),
+        (ServingPipelineType.DISTILLED, "distilled"),
+        (ServingPipelineType.TI2VID_TWO_STAGES, "two_stage"),
+    ],
+)
+def test_build_default_runner_accepts_explicit_registry_in_gpu_mode(monkeypatch, tmp_path: Path, pipeline_type, expected_constructor) -> None:
+    seen: dict[str, dict[str, object]] = {}
+    startup_registry = object()
+
+    class DummyPipeline:
+        def __init__(self, **kwargs):
+            seen[expected_constructor] = kwargs
+
+    class DummyLora:
+        def __init__(self, *args):
+            self.args = args
+
+    modules = {
+        "ltx_core.loader": SimpleNamespace(
+            LTXV_LORA_COMFY_RENAMING_MAP=object(),
+            LoraPathStrengthAndSDOps=DummyLora,
+            StateDictRegistry=lambda: object(),
+        ),
+        "ltx_pipelines.ti2vid_one_stage": SimpleNamespace(TI2VidOneStagePipeline=DummyPipeline),
+        "ltx_pipelines.distilled": SimpleNamespace(DistilledPipeline=DummyPipeline),
+        "ltx_pipelines.ti2vid_two_stages": SimpleNamespace(TI2VidTwoStagesPipeline=DummyPipeline),
+    }
+
+    monkeypatch.setattr(backend_module.importlib, "import_module", lambda name: modules[name])
+
+    runner = backend_module.build_default_runner(
+        _make_test_config(tmp_path, pipeline_type=pipeline_type, keep_model_weights_on_gpu=True),
+        execution_mode=ExecutionMode.SINGLE,
+        gpu_ids=(0,),
+        primary_device=torch.device("cuda:0"),
+        registry=startup_registry,
+    )
+
+    assert runner is not None
+    assert seen[expected_constructor]["registry"] is startup_registry
 
 
 def test_model_ledger_caches_video_encoder_when_enabled(monkeypatch) -> None:
@@ -383,8 +476,333 @@ def test_model_ledger_does_not_cache_video_encoder_by_default() -> None:
     assert builder.calls == 2
 
 
+def test_state_dict_registry_deduplicates_concurrent_loads() -> None:
+    registry_module = import_module("ltx_core.loader.registry")
+    primitives_module = import_module("ltx_core.loader.primitives")
+    StateDictRegistry = registry_module.StateDictRegistry
+    StateDict = primitives_module.StateDict
+
+    registry = StateDictRegistry()
+    loader_started = threading.Event()
+    release_loader = threading.Event()
+    load_calls = 0
+    results: list[object] = []
+    errors: list[BaseException] = []
+    expected_state_dict = StateDict(
+        sd={"weight": torch.ones((1, 1), dtype=torch.float32)},
+        device=torch.device("cpu"),
+        size=4,
+        dtype={torch.float32},
+    )
+
+    def loader():
+        nonlocal load_calls
+        load_calls += 1
+        loader_started.set()
+        assert release_loader.wait(timeout=1.0)
+        return expected_state_dict
+
+    def invoke_registry() -> None:
+        try:
+            results.append(registry.get_or_add(["checkpoint.safetensors"], None, loader))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=invoke_registry)
+    second_thread = threading.Thread(target=invoke_registry)
+
+    first_thread.start()
+    assert loader_started.wait(timeout=1.0)
+    second_thread.start()
+    time.sleep(0.05)
+    assert load_calls == 1
+
+    release_loader.set()
+    first_thread.join(timeout=1.0)
+    second_thread.join(timeout=1.0)
+
+    assert not errors
+    assert results == [expected_state_dict, expected_state_dict]
+
+
+def test_state_dict_registry_reuses_same_shards_regardless_of_path_order() -> None:
+    registry_module = import_module("ltx_core.loader.registry")
+    primitives_module = import_module("ltx_core.loader.primitives")
+    StateDictRegistry = registry_module.StateDictRegistry
+    StateDict = primitives_module.StateDict
+
+    registry = StateDictRegistry()
+    load_calls = 0
+    expected_state_dict = StateDict(
+        sd={"weight": torch.ones((1, 1), dtype=torch.float32)},
+        device=torch.device("cpu"),
+        size=4,
+        dtype={torch.float32},
+    )
+
+    def loader():
+        nonlocal load_calls
+        load_calls += 1
+        return expected_state_dict
+
+    first = registry.get_or_add(["gemma-b.safetensors", "gemma-a.safetensors"], None, loader)
+    second = registry.get_or_add(["gemma-a.safetensors", "gemma-b.safetensors"], None, loader)
+
+    assert first is expected_state_dict
+    assert second is expected_state_dict
+    assert load_calls == 1
+
+
+def test_model_ledger_shared_registry_reuses_cpu_state_dicts_across_ledgers() -> None:
+    model_ledger_module = import_module("ltx_pipelines.utils.model_ledger")
+    loader_module = import_module("ltx_core.loader")
+    primitives_module = import_module("ltx_core.loader.primitives")
+    ModelLedger = model_ledger_module.ModelLedger
+    SingleGPUModelBuilder = loader_module.SingleGPUModelBuilder
+    StateDictRegistry = loader_module.StateDictRegistry
+    StateDict = primitives_module.StateDict
+
+    load_devices: list[torch.device | None] = []
+    built_modules: list[torch.nn.Module] = []
+
+    class FakeLoader:
+        def metadata(self, path: str) -> dict[str, object]:
+            _ = path
+            return {}
+
+        def load(self, path, sd_ops=None, device=None):
+            _ = (path, sd_ops)
+            load_devices.append(device)
+            tensor = torch.ones((1, 1), dtype=torch.float32, device=device or torch.device("cpu"))
+            return StateDict(
+                sd={"weight": tensor},
+                device=device or torch.device("cpu"),
+                size=tensor.nelement() * tensor.element_size(),
+                dtype={tensor.dtype},
+            )
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty((1, 1)))
+            self.to_calls: list[torch.device] = []
+
+        def to(self, *args, **kwargs):
+            device = kwargs.get("device", args[0] if args else None)
+            if device is not None:
+                self.to_calls.append(torch.device(device))
+            return self
+
+        def eval(self):
+            return self
+
+    class FakeConfigurator:
+        @classmethod
+        def from_config(cls, config: dict[str, object]) -> FakeModule:
+            _ = config
+            module = FakeModule()
+            built_modules.append(module)
+            return module
+
+    shared_registry = StateDictRegistry()
+    shared_builder = SingleGPUModelBuilder(
+        model_class_configurator=FakeConfigurator,
+        model_path="checkpoint.safetensors",
+        model_loader=FakeLoader(),
+        registry=shared_registry,
+    )
+
+    first_ledger = ModelLedger(dtype=torch.float32, device=torch.device("cuda:0"), registry=shared_registry)
+    second_ledger = ModelLedger(dtype=torch.float32, device=torch.device("cuda:1"), registry=shared_registry)
+    first_ledger.vae_encoder_builder = shared_builder
+    second_ledger.vae_encoder_builder = shared_builder
+
+    first_encoder = first_ledger.video_encoder()
+    second_encoder = second_ledger.video_encoder()
+
+    assert first_encoder is not second_encoder
+    assert load_devices == [torch.device("cpu")]
+    assert built_modules[0].to_calls == [torch.device("cpu"), torch.device("cuda:0")]
+    assert built_modules[1].to_calls == [torch.device("cpu"), torch.device("cuda:1")]
+
+
+def test_model_ledger_release_state_dict_registry_rebinds_builders(monkeypatch) -> None:
+    model_ledger_module = import_module("ltx_pipelines.utils.model_ledger")
+    loader_module = import_module("ltx_core.loader")
+    primitives_module = import_module("ltx_core.loader.primitives")
+    ModelLedger = model_ledger_module.ModelLedger
+    SingleGPUModelBuilder = loader_module.SingleGPUModelBuilder
+    DummyRegistry = loader_module.DummyRegistry
+    StateDict = primitives_module.StateDict
+
+    load_devices: list[torch.device | None] = []
+
+    class TrackingRegistry:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.state_dict = StateDict(
+                sd={"weight": torch.ones((1, 1), dtype=torch.float32)},
+                device=torch.device("cpu"),
+                size=4,
+                dtype={torch.float32},
+            )
+
+        def add(self, paths, sd_ops, state_dict):
+            _ = (paths, sd_ops, state_dict)
+            return None
+
+        def get(self, paths, sd_ops):
+            _ = (paths, sd_ops)
+            return None
+
+        def get_or_add(self, paths, sd_ops, loader):
+            _ = (paths, sd_ops, loader)
+            self.calls += 1
+            return self.state_dict
+
+        def clear(self) -> None:
+            return None
+
+    class FakeLoader:
+        def metadata(self, path: str) -> dict[str, object]:
+            _ = path
+            return {}
+
+        def load(self, path, sd_ops=None, device=None):
+            _ = (path, sd_ops)
+            load_devices.append(device)
+            tensor = torch.ones((1, 1), dtype=torch.float32, device=device or torch.device("cpu"))
+            return StateDict(
+                sd={"weight": tensor},
+                device=device or torch.device("cpu"),
+                size=tensor.nelement() * tensor.element_size(),
+                dtype={tensor.dtype},
+            )
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty((1, 1)))
+
+        def to(self, *args, **kwargs):
+            _ = (args, kwargs)
+            return self
+
+        def eval(self):
+            return self
+
+    class FakeConfigurator:
+        @classmethod
+        def from_config(cls, config: dict[str, object]) -> FakeModule:
+            _ = config
+            return FakeModule()
+
+    tracking_registry = TrackingRegistry()
+    builder = SingleGPUModelBuilder(
+        model_class_configurator=FakeConfigurator,
+        model_path="checkpoint.safetensors",
+        model_loader=FakeLoader(),
+        registry=tracking_registry,
+    )
+    ledger = ModelLedger(dtype=torch.float32, device=torch.device("cuda:0"), registry=tracking_registry, cache_models=True)
+    ledger.vae_encoder_builder = builder
+
+    _ = ledger.video_encoder()
+    assert tracking_registry.calls == 1
+    assert load_devices == []
+
+    ledger.release_state_dict_registry()
+    assert isinstance(ledger.registry, DummyRegistry)
+    assert isinstance(ledger.vae_encoder_builder.registry, DummyRegistry)
+
+    ledger.clear_cached_models()
+    _ = ledger.video_encoder()
+    assert tracking_registry.calls == 1
+    assert load_devices == [torch.device("cuda:0")]
+
+
+def test_model_ledger_preload_uses_quantized_transformer_builder_key() -> None:
+    model_ledger_module = import_module("ltx_pipelines.utils.model_ledger")
+    loader_module = import_module("ltx_core.loader")
+    ModelLedger = model_ledger_module.ModelLedger
+    SDOps = loader_module.SDOps
+    StateDictRegistry = loader_module.StateDictRegistry
+
+    base_sd_ops = SDOps(name="base", mapping=())
+    quantized_sd_ops = SDOps(name="fp8", mapping=())
+    module_op = loader_module.ModuleOps(name="quant", matcher=lambda module: False, mutator=lambda module: module)
+    preload_calls: list[tuple[str | None, tuple[object, ...], torch.device | None]] = []
+
+    @dataclass(frozen=True)
+    class FakeBuilder:
+        model_sd_ops: object | None = None
+        module_ops: tuple[object, ...] = ()
+
+        def preload(self, device: torch.device | None = None) -> None:
+            sd_ops_name = getattr(self.model_sd_ops, "name", None)
+            preload_calls.append((sd_ops_name, self.module_ops, device))
+
+    ledger = ModelLedger(
+        dtype=torch.float32,
+        device=torch.device("cuda:0"),
+        registry=StateDictRegistry(),
+        quantization=SimpleNamespace(sd_ops=quantized_sd_ops, module_ops=(module_op,)),
+    )
+    ledger.transformer_builder = FakeBuilder(model_sd_ops=base_sd_ops)
+
+    ledger.preload_state_dicts()
+
+    assert preload_calls == [("sd_ops_chain_base+fp8", (module_op,), torch.device("cpu"))]
+
+
+def test_model_ledger_builds_quantized_lora_transformer_on_cpu_before_gpu_cache(monkeypatch) -> None:
+    model_ledger_module = import_module("ltx_pipelines.utils.model_ledger")
+    loader_module = import_module("ltx_core.loader")
+    ModelLedger = model_ledger_module.ModelLedger
+    SDOps = loader_module.SDOps
+    LoraPathStrengthAndSDOps = loader_module.LoraPathStrengthAndSDOps
+
+    build_devices: list[torch.device] = []
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones((1, 1), dtype=torch.float32))
+
+        def eval(self):
+            return self
+
+    @dataclass(frozen=True)
+    class FakeBuilder:
+        model_sd_ops: object | None = None
+        module_ops: tuple[object, ...] = ()
+
+        def build(self, device: torch.device | None = None, dtype=None):
+            _ = dtype
+            assert device is not None
+            build_devices.append(torch.device(device))
+            return FakeModule()
+
+    monkeypatch.setattr(model_ledger_module, "X0Model", lambda model: model)
+
+    ledger = ModelLedger(
+        dtype=torch.float32,
+        device=torch.device("cuda:0"),
+        loras=(LoraPathStrengthAndSDOps("distilled-lora.safetensors", 1.0, None),),
+        cache_models=True,
+        quantization=SimpleNamespace(sd_ops=SDOps(name="fp8", mapping=()), module_ops=()),
+    )
+    ledger.transformer_builder = FakeBuilder()
+
+    transformer = ledger.transformer()
+
+    assert transformer is ledger.transformer()
+    assert build_devices == [torch.device("cpu")]
+
+
 def test_backend_shutdown_releases_cached_pipeline_models(tmp_path: Path) -> None:
     release_calls: list[str] = []
+    clear_calls: list[str] = []
 
     class FakePipeline:
         def release_cached_models(self) -> None:
@@ -394,6 +812,7 @@ def test_backend_shutdown_releases_cached_pipeline_models(tmp_path: Path) -> Non
         config=_make_test_config(tmp_path),
         runner_factory=lambda: backend_module.OneStagePipelineRunner(pipeline=FakePipeline()),
     )
+    backend._shared_weight_registry = SimpleNamespace(clear=lambda: clear_calls.append("cleared"))
 
     async def scenario() -> None:
         await backend.start()
@@ -404,6 +823,199 @@ def test_backend_shutdown_releases_cached_pipeline_models(tmp_path: Path) -> Non
     asyncio.run(scenario())
 
     assert release_calls == ["released"]
+    assert clear_calls == ["cleared"]
+
+
+def test_prepare_cudagraph_thread_state_initializes_worker_thread_tls(monkeypatch) -> None:
+    cudagraph_trees = import_module("torch._inductor.cudagraph_trees")
+    step_calls: list[int] = []
+    thread_observations: list[tuple[bool, bool] | tuple[bool, bool, bool, bool]] = []
+
+    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: step_calls.append(threading.get_ident()))
+
+    def target() -> None:
+        thread_observations.append(
+            (
+                hasattr(cudagraph_trees.local, "tree_manager_containers"),
+                hasattr(cudagraph_trees.local, "tree_manager_locks"),
+            )
+        )
+        backend_module._prepare_cudagraph_thread_state()
+        thread_observations.append(
+            (
+                hasattr(cudagraph_trees.local, "tree_manager_containers"),
+                hasattr(cudagraph_trees.local, "tree_manager_locks"),
+                isinstance(cudagraph_trees.local.tree_manager_containers, dict),
+                isinstance(cudagraph_trees.local.tree_manager_locks, dict),
+            )
+        )
+
+    worker_thread = threading.Thread(target=target)
+    worker_thread.start()
+    worker_thread.join(timeout=1.0)
+
+    assert thread_observations[0] == (False, False)
+    assert thread_observations[1] == (True, True, True, True)
+    assert len(step_calls) == 1
+
+
+def test_backend_start_preloads_shared_weights_before_accepting_jobs(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+    runner_calls: list[str] = []
+
+    class FakeRunner:
+        def preload(self) -> None:
+            runner_calls.append("preload")
+
+        def close(self) -> None:
+            runner_calls.append("close")
+
+    monkeypatch.setattr(backend_module, "build_default_runner", lambda *args, **kwargs: FakeRunner())
+    backend = PipelineServiceBackend(config=_make_test_config(tmp_path))
+
+    async def scenario() -> None:
+        await backend.start()
+        try:
+            assert runner_calls == ["preload", "close"]
+            assert backend._shared_weights_preloaded is True
+            assert backend._accepting_jobs is True
+            assert backend.health().pipeline_loaded is True
+            assert backend.health().loaded_runner_count == 0
+        finally:
+            await backend.shutdown()
+
+    asyncio.run(scenario())
+    assert backend._shared_weights_preloaded is False
+
+
+def test_backend_start_preloads_gpu_weights_per_worker_when_enabled(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    clear_calls: list[str] = []
+    runner_calls: list[tuple[str, str, object | None]] = []
+    startup_registry = SimpleNamespace(clear=lambda: clear_calls.append("cleared"))
+
+    original_import_module = backend_module.importlib.import_module
+
+    class FakeRunner:
+        def __init__(self, device: torch.device) -> None:
+            self.device = device
+
+        def preload(self) -> None:
+            runner_calls.append(("preload", str(self.device), None))
+
+        def release_startup_weight_cache(self) -> None:
+            runner_calls.append(("release", str(self.device), None))
+
+        def close(self) -> None:
+            runner_calls.append(("close", str(self.device), None))
+
+    def fake_build_default_runner(config, *, primary_device, registry, **kwargs):
+        _ = (config, kwargs)
+        runner_calls.append(("build", str(primary_device), registry))
+        return FakeRunner(primary_device)
+
+    monkeypatch.setattr(
+        backend_module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(StateDictRegistry=lambda: startup_registry)
+        if name == "ltx_core.loader"
+        else original_import_module(name),
+    )
+    monkeypatch.setattr(backend_module, "build_default_runner", fake_build_default_runner)
+    backend = PipelineServiceBackend(
+        config=_make_test_config(
+            tmp_path,
+            execution_mode=ExecutionMode.DATA_PARALLEL,
+            keep_model_weights_on_gpu=True,
+        )
+    )
+
+    async def scenario() -> None:
+        await backend.start()
+        try:
+            assert backend._shared_weight_registry is None
+            assert backend._startup_weight_registry is None
+            assert backend._shared_weights_preloaded is False
+            assert backend.health().pipeline_loaded is True
+            assert backend.health().loaded_runner_count == 2
+            assert runner_calls == [
+                ("build", "cuda:0", startup_registry),
+                ("preload", "cuda:0", None),
+                ("build", "cuda:1", startup_registry),
+                ("preload", "cuda:1", None),
+                ("release", "cuda:0", None),
+                ("release", "cuda:1", None),
+            ]
+            assert clear_calls == ["cleared"]
+        finally:
+            await backend.shutdown()
+
+    asyncio.run(scenario())
+    assert runner_calls[-2:] == [("close", "cuda:0", None), ("close", "cuda:1", None)]
+
+
+def test_backend_start_cleans_up_gpu_runners_when_preload_fails(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    clear_calls: list[str] = []
+    runner_events: list[tuple[str, str]] = []
+    startup_registry = SimpleNamespace(clear=lambda: clear_calls.append("cleared"))
+
+    original_import_module = backend_module.importlib.import_module
+
+    class FakeRunner:
+        def __init__(self, device: torch.device) -> None:
+            self.device = device
+
+        def preload(self) -> None:
+            runner_events.append(("preload", str(self.device)))
+            if self.device == torch.device("cuda:1"):
+                raise FileNotFoundError("missing checkpoint path /models/missing.safetensors")
+
+        def close(self) -> None:
+            runner_events.append(("close", str(self.device)))
+
+    monkeypatch.setattr(
+        backend_module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(StateDictRegistry=lambda: startup_registry)
+        if name == "ltx_core.loader"
+        else original_import_module(name),
+    )
+    monkeypatch.setattr(
+        backend_module,
+        "build_default_runner",
+        lambda config, *, primary_device, registry, **kwargs: FakeRunner(primary_device),
+    )
+    backend = PipelineServiceBackend(
+        config=_make_test_config(
+            tmp_path,
+            execution_mode=ExecutionMode.DATA_PARALLEL,
+            keep_model_weights_on_gpu=True,
+        )
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(FileNotFoundError, match="missing checkpoint path"):
+            await backend.start()
+        assert backend._runners == {}
+        assert backend._accepting_jobs is False
+        assert backend._worker_tasks == []
+        assert backend._startup_weight_registry is None
+
+    asyncio.run(scenario())
+    assert runner_events == [
+        ("preload", "cuda:0"),
+        ("preload", "cuda:1"),
+        ("close", "cuda:0"),
+        ("close", "cuda:1"),
+    ]
+    assert clear_calls == ["cleared"]
 
 
 def test_data_parallel_backend_balances_jobs_across_gpu_workers(monkeypatch, tmp_path: Path) -> None:
@@ -1630,6 +2242,24 @@ def test_fastapi_rejects_missing_multipart_upload_reference(tmp_path: Path) -> N
 
     assert response.status_code == 422
     assert "Multipart upload field 'missing_upload' was not provided." in response.text
+
+
+def test_fastapi_startup_fails_when_shared_weight_preload_fails(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+    class FailingRunner:
+        def preload(self) -> None:
+            raise FileNotFoundError("missing checkpoint path /models/missing.safetensors")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(backend_module, "build_default_runner", lambda *args, **kwargs: FailingRunner())
+
+    with pytest.raises(FileNotFoundError, match="missing checkpoint path"):
+        with TestClient(create_app(_make_test_config(tmp_path))):
+            pass
 
 
 def test_fastapi_rejects_upload_source_in_json_requests(tmp_path: Path) -> None:
