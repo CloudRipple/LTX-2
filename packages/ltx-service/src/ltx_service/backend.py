@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -114,9 +115,37 @@ def _video_with_progress(
     return iterator()
 
 
+def _prepare_cudagraph_thread_state() -> None:
+    try:
+        cudagraph_trees = importlib.import_module("torch._inductor.cudagraph_trees")
+    except Exception:
+        return
+
+    local = getattr(cudagraph_trees, "local", None)
+    if local is not None:
+        if not hasattr(local, "tree_manager_containers"):
+            local.tree_manager_containers = {}
+        if not hasattr(local, "tree_manager_locks"):
+            local.tree_manager_locks = defaultdict(threading.Lock)
+
+    mark_step_begin = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+    if callable(mark_step_begin):
+        mark_step_begin()
+
+
 @dataclass
 class OneStagePipelineRunner:
     pipeline: Any
+
+    def preload(self) -> None:
+        preload = getattr(self.pipeline, "preload_weights", None)
+        if callable(preload):
+            preload()
+
+    def release_startup_weight_cache(self) -> None:
+        release = getattr(self.pipeline, "release_startup_weight_cache", None)
+        if callable(release):
+            release()
 
     def generate(
         self,
@@ -161,6 +190,16 @@ class OneStagePipelineRunner:
 @dataclass
 class DistilledPipelineRunner:
     pipeline: Any
+
+    def preload(self) -> None:
+        preload = getattr(self.pipeline, "preload_weights", None)
+        if callable(preload):
+            preload()
+
+    def release_startup_weight_cache(self) -> None:
+        release = getattr(self.pipeline, "release_startup_weight_cache", None)
+        if callable(release):
+            release()
 
     def generate(
         self,
@@ -207,6 +246,16 @@ class DistilledPipelineRunner:
 @dataclass
 class TwoStagePipelineRunner:
     pipeline: Any
+
+    def preload(self) -> None:
+        preload = getattr(self.pipeline, "preload_weights", None)
+        if callable(preload):
+            preload()
+
+    def release_startup_weight_cache(self) -> None:
+        release = getattr(self.pipeline, "release_startup_weight_cache", None)
+        if callable(release):
+            release()
 
     def generate(
         self,
@@ -295,6 +344,7 @@ def build_default_runner(
     execution_mode: ExecutionMode,
     gpu_ids: tuple[int, ...],
     primary_device: torch.device,
+    registry: object | None = None,
 ) -> PipelineRunner:
     loader_module = importlib.import_module("ltx_core.loader")
     distilled_module = importlib.import_module("ltx_pipelines.distilled")
@@ -303,9 +353,11 @@ def build_default_runner(
 
     LTXV_LORA_COMFY_RENAMING_MAP = getattr(loader_module, "LTXV_LORA_COMFY_RENAMING_MAP")
     LoraPathStrengthAndSDOps = getattr(loader_module, "LoraPathStrengthAndSDOps")
+    StateDictRegistry = getattr(loader_module, "StateDictRegistry")
     DistilledPipeline = getattr(distilled_module, "DistilledPipeline")
     TI2VidOneStagePipeline = getattr(one_stage_module, "TI2VidOneStagePipeline")
     TI2VidTwoStagesPipeline = getattr(two_stage_module, "TI2VidTwoStagesPipeline")
+    shared_registry = registry if registry is not None else (None if config.keep_model_weights_on_gpu else StateDictRegistry())
 
     if execution_mode is ExecutionMode.SHARDED:
         raise ValueError("Standalone ltx-service currently supports single-device official pipelines only.")
@@ -319,6 +371,7 @@ def build_default_runner(
             quantization=config.quantization,
             keep_stage_weights_on_gpu=config.keep_stage_weights_on_gpu,
             keep_model_weights_on_gpu=config.keep_model_weights_on_gpu,
+            registry=shared_registry,
         )
         return OneStagePipelineRunner(pipeline=pipeline)
 
@@ -332,6 +385,7 @@ def build_default_runner(
             quantization=config.quantization,
             keep_stage_weights_on_gpu=config.keep_stage_weights_on_gpu,
             keep_model_weights_on_gpu=config.keep_model_weights_on_gpu,
+            registry=shared_registry,
         )
         return DistilledPipelineRunner(pipeline=pipeline)
 
@@ -352,6 +406,7 @@ def build_default_runner(
         quantization=config.quantization,
         keep_stage_weights_on_gpu=config.keep_stage_weights_on_gpu,
         keep_model_weights_on_gpu=config.keep_model_weights_on_gpu,
+        registry=shared_registry,
     )
     return TwoStagePipelineRunner(pipeline=pipeline)
 
@@ -372,6 +427,11 @@ class PipelineServiceBackend:
         self._execution_mode = config.resolved_execution_mode()
         self._primary_device = config.primary_device()
         self._worker_devices = config.worker_devices()
+        self._shared_weight_registry: object | None = None
+        self._startup_weight_registry: object | None = None
+        if runner_factory is None and not config.keep_model_weights_on_gpu:
+            loader_module = importlib.import_module("ltx_core.loader")
+            self._shared_weight_registry = getattr(loader_module, "StateDictRegistry")()
 
         self._custom_runner_factory = runner_factory
         self._runners: dict[int, PipelineRunner] = {}
@@ -387,9 +447,11 @@ class PipelineServiceBackend:
             worker_index: None for worker_index, _ in enumerate(self._worker_devices)
         }
         self._last_progress_line: str | None = None
+        self._shared_weights_preloaded = False
 
     async def start(self) -> None:
         if not self._worker_tasks:
+            await self._preload_startup_weights()
             self._accepting_jobs = True
             self._worker_tasks = [
                 asyncio.create_task(self._run_worker(worker_index, device))
@@ -411,6 +473,16 @@ class PipelineServiceBackend:
             close = getattr(runner, "close", None)
             if callable(close):
                 await asyncio.to_thread(close)
+        if self._shared_weight_registry is not None:
+            clear = getattr(self._shared_weight_registry, "clear", None)
+            if callable(clear):
+                await asyncio.to_thread(clear)
+        if self._startup_weight_registry is not None:
+            clear = getattr(self._startup_weight_registry, "clear", None)
+            if callable(clear):
+                await asyncio.to_thread(clear)
+            self._startup_weight_registry = None
+        self._shared_weights_preloaded = False
         self._worker_tasks = []
 
     async def submit(
@@ -456,7 +528,7 @@ class PipelineServiceBackend:
         workers = self._worker_statuses()
         return HealthResponse(
             status="degraded" if any(worker.status == "error" for worker in workers) else "ok",
-            pipeline_loaded=loaded_runner_count > 0,
+            pipeline_loaded=self._shared_weights_preloaded or loaded_runner_count > 0,
             queue_depth=self._queue.qsize(),
             pipeline_type=self.config.pipeline_type,
             execution_mode=self._execution_mode,
@@ -541,6 +613,7 @@ class PipelineServiceBackend:
                 execution_mode=self._execution_mode,
                 gpu_ids=self._gpu_ids,
                 primary_device=device,
+                registry=self._startup_weight_registry if self._startup_weight_registry is not None else self._shared_weight_registry,
             )
 
         factory = self._custom_runner_factory
@@ -561,6 +634,77 @@ class PipelineServiceBackend:
         }
         return factory(**accepted_kwargs)
 
+    async def _preload_shared_weights(self) -> None:
+        if self._custom_runner_factory is not None:
+            return
+
+        if self._shared_weight_registry is None or self._shared_weights_preloaded:
+            return
+
+        preload_runner = build_default_runner(
+            self.config,
+            execution_mode=self._execution_mode,
+            gpu_ids=self._gpu_ids,
+            primary_device=self._primary_device,
+            registry=self._shared_weight_registry,
+        )
+        close = getattr(preload_runner, "close", None)
+
+        try:
+            preload = getattr(preload_runner, "preload", None)
+            if callable(preload):
+                await asyncio.to_thread(preload)
+            self._shared_weights_preloaded = True
+        except Exception:
+            clear = getattr(self._shared_weight_registry, "clear", None)
+            if callable(clear):
+                await asyncio.to_thread(clear)
+            raise
+        finally:
+            if callable(close):
+                await asyncio.to_thread(close)
+
+    async def _preload_gpu_runners(self) -> None:
+        if self._custom_runner_factory is not None or not self.config.keep_model_weights_on_gpu:
+            return
+
+        loader_module = importlib.import_module("ltx_core.loader")
+        self._startup_weight_registry = getattr(loader_module, "StateDictRegistry")()
+        close_runner_indices: list[int] = []
+        try:
+            for worker_index, device in enumerate(self._worker_devices):
+                runner = self._ensure_runner(worker_index, device)
+                close_runner_indices.append(worker_index)
+                preload = getattr(runner, "preload", None)
+                if callable(preload):
+                    await asyncio.to_thread(preload)
+            for runner in self._runners.values():
+                release_startup_weight_cache = getattr(runner, "release_startup_weight_cache", None)
+                if callable(release_startup_weight_cache):
+                    await asyncio.to_thread(release_startup_weight_cache)
+        except Exception:
+            for close_worker_index in close_runner_indices:
+                runner = self._runners.pop(close_worker_index, None)
+                if runner is None:
+                    continue
+                close = getattr(runner, "close", None)
+                if callable(close):
+                    await asyncio.to_thread(close)
+            raise
+        finally:
+            if self._startup_weight_registry is not None:
+                clear = getattr(self._startup_weight_registry, "clear", None)
+                if callable(clear):
+                    await asyncio.to_thread(clear)
+                self._startup_weight_registry = None
+
+    async def _preload_startup_weights(self) -> None:
+        if self.config.keep_model_weights_on_gpu:
+            await self._preload_gpu_runners()
+            return
+
+        await self._preload_shared_weights()
+
     def _run_generation(
         self,
         runner: PipelineRunner,
@@ -568,6 +712,7 @@ class PipelineServiceBackend:
         output_path: Path,
         progress_callback: Callable[[str, int, int], None],
     ) -> None:
+        _prepare_cudagraph_thread_state()
         signature = inspect.signature(runner.generate)
         if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
             runner.generate(request, output_path, progress_callback=progress_callback)

@@ -1,12 +1,13 @@
 import functools
 from pathlib import Path
+from typing import Any, Mapping, Sequence, cast
 
 import torch
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
 
-from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
-from ltx_core.utils import find_matching_file
+from ....loader.module_ops import ModuleOps
+from ....utils import find_matching_file
+from ..tokenizer import LTXVGemmaTokenizer
 
 
 class GemmaTextEncoder(torch.nn.Module):
@@ -28,6 +29,21 @@ class GemmaTextEncoder(torch.nn.Module):
         self.processor = processor
         self._dtype = dtype
 
+    def _require_model(self) -> Gemma3ForConditionalGeneration:
+        if self.model is None:
+            raise ValueError("Gemma model is not loaded.")
+        return self.model
+
+    def _require_tokenizer(self) -> LTXVGemmaTokenizer:
+        if self.tokenizer is None:
+            raise ValueError("Gemma tokenizer is not loaded.")
+        return self.tokenizer
+
+    def _require_processor(self) -> Gemma3Processor:
+        if self.processor is None:
+            raise ValueError("Gemma processor is not loaded.")
+        return self.processor
+
     def encode(
         self,
         text: str,
@@ -38,10 +54,12 @@ class GemmaTextEncoder(torch.nn.Module):
         Returns:
             (hidden_states, attention_mask) where hidden_states is a tuple of per-layer tensors.
         """
-        token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
-        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
-        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
-        outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        tokenizer = self._require_tokenizer()
+        model = self._require_model()
+        token_pairs = tokenizer.tokenize_with_weights(text)["gemma"]
+        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=model.device)
+        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=model.device)
+        outputs = model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         hidden_states = outputs.hidden_states
         del outputs
         return hidden_states, attention_mask
@@ -50,31 +68,39 @@ class GemmaTextEncoder(torch.nn.Module):
 
     def _enhance(
         self,
-        messages: list[dict[str, str]],
+        messages: Sequence[Mapping[str, object]],
         image: torch.Tensor | None = None,
         max_new_tokens: int = 512,
         seed: int = 10,
     ) -> str:
-        text = self.processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        model = self._require_model()
+        processor = self._require_processor()
+        model_any = cast(Any, model)
+        processor_any = cast(Any, processor)
+        processor_tokenizer = cast(Any, processor_any.tokenizer)
+        text = processor_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-        model_inputs = self.processor(
+        model_inputs = cast(
+            Any,
+            processor_any(
             text=text,
             images=image,
             return_tensors="pt",
-        ).to(self.model.device)
-        pad_token_id = self.processor.tokenizer.pad_token_id if self.processor.tokenizer.pad_token_id is not None else 0
-        model_inputs = _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id)
+            ).to(model.device),
+        )
+        pad_token_id = processor_tokenizer.pad_token_id if processor_tokenizer.pad_token_id is not None else 0
+        model_inputs = cast(Any, _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id))
 
-        with torch.inference_mode(), torch.random.fork_rng(devices=[self.model.device]):
+        with torch.inference_mode(), torch.random.fork_rng(devices=[model.device]):
             torch.manual_seed(seed)
-            outputs = self.model.generate(
+            outputs = model_any.generate(
                 **model_inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=0.7,
             )
-            generated_ids = outputs[0][len(model_inputs.input_ids[0]) :]
-            enhanced_prompt = self.processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            generated_ids = outputs[0][len(model_inputs["input_ids"][0]) :]
+            enhanced_prompt = processor_tokenizer.decode(generated_ids, skip_special_tokens=True)
 
         return enhanced_prompt
 
@@ -161,13 +187,13 @@ def _pad_inputs_for_attention_alignment(
     alignment: int = 8,
 ) -> dict[str, torch.Tensor]:
     """Pad sequence length to multiple of alignment for Flash Attention compatibility."""
-    seq_len = model_inputs.input_ids.shape[1]
+    seq_len = model_inputs["input_ids"].shape[1]
     padded_len = ((seq_len + alignment - 1) // alignment) * alignment
     padding_length = padded_len - seq_len
 
     if padding_length > 0:
-        model_inputs["input_ids"] = _cat_with_padding(model_inputs.input_ids, padding_length, pad_token_id)
-        model_inputs["attention_mask"] = _cat_with_padding(model_inputs.attention_mask, padding_length, 0)
+        model_inputs["input_ids"] = _cat_with_padding(model_inputs["input_ids"], padding_length, pad_token_id)
+        model_inputs["attention_mask"] = _cat_with_padding(model_inputs["attention_mask"], padding_length, 0)
         if "token_type_ids" in model_inputs and model_inputs["token_type_ids"] is not None:
             model_inputs["token_type_ids"] = _cat_with_padding(model_inputs["token_type_ids"], padding_length, 0)
 
@@ -178,11 +204,15 @@ def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
     tokenizer_root = str(find_matching_file(gemma_root, "tokenizer.model").parent)
     processor_root = str(find_matching_file(gemma_root, "preprocessor_config.json").parent)
 
-    def load_tokenizer(module: GemmaTextEncoder) -> GemmaTextEncoder:
+    def load_tokenizer(module: torch.nn.Module) -> torch.nn.Module:
+        if not isinstance(module, GemmaTextEncoder):
+            return module
         module.tokenizer = LTXVGemmaTokenizer(tokenizer_root, 1024)
         return module
 
-    def load_processor(module: GemmaTextEncoder) -> GemmaTextEncoder:
+    def load_processor(module: torch.nn.Module) -> torch.nn.Module:
+        if not isinstance(module, GemmaTextEncoder):
+            return module
         image_processor = AutoImageProcessor.from_pretrained(processor_root, local_files_only=True)
         if not module.tokenizer:
             raise ValueError("Tokenizer model operation must be performed before processor model operation")
