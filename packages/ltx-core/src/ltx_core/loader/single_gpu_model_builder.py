@@ -1,12 +1,13 @@
 import logging
 from dataclasses import dataclass, field, replace
-from typing import Generic
+from typing import Generic, cast
 
 import torch
 
-from ltx_core.loader.fuse_loras import apply_loras
-from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.loader.primitives import (
+from ..model.model_protocol import ModelConfigurator, ModelType
+from .fuse_loras import apply_loras
+from .module_ops import ModuleOps
+from .primitives import (
     LoRAAdaptableProtocol,
     LoraPathStrengthAndSDOps,
     LoraStateDictWithStrength,
@@ -14,10 +15,9 @@ from ltx_core.loader.primitives import (
     StateDict,
     StateDictLoader,
 )
-from ltx_core.loader.registry import DummyRegistry, Registry
-from ltx_core.loader.sd_ops import SDOps
-from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
-from ltx_core.model.model_protocol import ModelConfigurator, ModelType
+from .registry import DummyRegistry, Registry
+from .sd_ops import SDOps
+from .sft_loader import SafetensorsModelStateDictLoader
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -50,29 +50,38 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     registry: Registry = field(default_factory=DummyRegistry)
     lora_load_device: torch.device = field(default_factory=lambda: torch.device("cpu"))
 
-    def lora(self, lora_path: str, strength: float = 1.0, sd_ops: SDOps | None = None) -> "SingleGPUModelBuilder":
+    def lora(
+        self, lora_path: str, strength: float = 1.0, sd_ops: SDOps | None = None
+    ) -> "SingleGPUModelBuilder[ModelType]":
         return replace(self, loras=(*self.loras, LoraPathStrengthAndSDOps(lora_path, strength, sd_ops)))
 
-    def model_config(self) -> dict:
+    def model_config(self) -> dict[str, object]:
         first_shard_path = self.model_path[0] if isinstance(self.model_path, tuple) else self.model_path
         return self.model_loader.metadata(first_shard_path)
 
-    def meta_model(self, config: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
+    def meta_model(self, config: dict[str, object], module_ops: list[ModuleOps] | None = None) -> ModelType:
+        resolved_module_ops = tuple(module_ops or ())
         with torch.device("meta"):
             model = self.model_class_configurator.from_config(config)
-        for module_op in module_ops:
+        for module_op in resolved_module_ops:
             if module_op.matcher(model):
-                model = module_op.mutator(model)
+                model = cast(ModelType, module_op.mutator(model))
         return model
 
     def load_sd(
         self, paths: list[str], registry: Registry, device: torch.device | None, sd_ops: SDOps | None = None
     ) -> StateDict:
-        state_dict = registry.get(paths, sd_ops)
-        if state_dict is None:
-            state_dict = self.model_loader.load(paths, sd_ops=sd_ops, device=device)
-            registry.add(paths, sd_ops=sd_ops, state_dict=state_dict)
-        return state_dict
+        return registry.get_or_add(
+            paths,
+            sd_ops,
+            lambda: self.model_loader.load(paths, sd_ops=sd_ops, device=device),
+        )
+
+    def preload(self, device: torch.device | None = None) -> None:
+        model_paths = list(self.model_path) if isinstance(self.model_path, tuple) else [self.model_path]
+        _ = self.load_sd(model_paths, sd_ops=self.model_sd_ops, registry=self.registry, device=device)
+        for lora in self.loras:
+            _ = self.load_sd([lora.path], sd_ops=lora.sd_ops, registry=self.registry, device=self.lora_load_device)
 
     def _return_model(self, meta_model: ModelType, device: torch.device) -> ModelType:
         uninitialized_params = [name for name, param in meta_model.named_parameters() if str(param.device) == "meta"]
@@ -86,7 +95,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     def build(self, device: torch.device | None = None, dtype: torch.dtype | None = None) -> ModelType:
         device = torch.device("cuda") if device is None else device
         config = self.model_config()
-        meta_model = self.meta_model(config, self.module_ops)
+        meta_model = self.meta_model(config, list(self.module_ops))
         model_paths = list(self.model_path) if isinstance(self.model_path, tuple) else [self.model_path]
         model_state_dict = self.load_sd(model_paths, sd_ops=self.model_sd_ops, registry=self.registry, device=device)
 

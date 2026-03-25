@@ -3,9 +3,9 @@ from typing import NamedTuple, Protocol
 
 import torch
 
-from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.loader.sd_ops import SDOps
-from ltx_core.model.model_protocol import ModelType
+from .module_ops import ModuleOps
+from .sd_ops import SDOps
+from ..model.model_protocol import ModelType
 
 
 @dataclass(frozen=True)
@@ -19,7 +19,7 @@ class StateDict:
     - dtype: Set of tensor dtypes present
     """
 
-    sd: dict
+    sd: dict[str, torch.Tensor]
     device: torch.device
     size: int
     dtype: set[torch.dtype]
@@ -36,15 +36,17 @@ class StateDictLoader(Protocol):
     - load: Load state dict from path(s) and apply SDOps transformations
     """
 
-    def metadata(self, path: str) -> dict:
+    def metadata(self, path: str) -> dict[str, object]:
         """
         Load metadata from path
         """
+        ...
 
     def load(self, path: str | list[str], sd_ops: SDOps | None = None, device: torch.device | None = None) -> StateDict:
         """
         Load state dict from path or paths (for sharded model storage) and apply sd_ops
         """
+        ...
 
 
 class ModelBuilderProtocol(Protocol[ModelType]):
@@ -55,7 +57,7 @@ class ModelBuilderProtocol(Protocol[ModelType]):
     - build: Create and initialize a model from state dictionary and apply dtype transformations
     """
 
-    def meta_model(self, config: dict, module_ops: list[ModuleOps] | None = None) -> ModelType:
+    def meta_model(self, config: dict[str, object], module_ops: list[ModuleOps] | None = None) -> ModelType:
         """
         Create a model on the meta device from a configuration dictionary.
         This decouples model creation from weight loading, allowing the model
@@ -68,7 +70,7 @@ class ModelBuilderProtocol(Protocol[ModelType]):
         """
         ...
 
-    def build(self, dtype: torch.dtype | None = None) -> ModelType:
+    def build(self, device: torch.device | None = None, dtype: torch.dtype | None = None) -> ModelType:
         """
         Build the model
         Args:
@@ -87,7 +89,7 @@ class LoRAAdaptableProtocol(Protocol):
     """
 
     def lora(self, lora_path: str, strength: float) -> "LoRAAdaptableProtocol":
-        pass
+        ...
 
 
 class LoraPathStrengthAndSDOps(NamedTuple):
@@ -97,7 +99,7 @@ class LoraPathStrengthAndSDOps(NamedTuple):
 
     path: str
     strength: float
-    sd_ops: SDOps
+    sd_ops: SDOps | None
 
 
 class LoraStateDictWithStrength(NamedTuple):
